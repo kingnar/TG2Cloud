@@ -225,7 +225,23 @@ class EvidenceTests(unittest.TestCase):
                 "destination_id": "id-1",
             },
             expected_size=10, expected_dest="library/a", expected_fingerprint="abc",
+        ), "reject")
+        self.assertEqual(assess(
+            {
+                "scheme": "clouddrive2-file", "read_back": True, "cache_only": False,
+                "is_cloud_file": True, "is_local": False, "destination_id": "id-1",
+                "size": 10, "dest_path": "library/a",
+            },
+            expected_size=10, expected_dest="library/a", expected_fingerprint="abc",
         ), "accept")
+        self.assertEqual(assess(
+            {
+                "scheme": "clouddrive2-file", "read_back": True, "cache_only": False,
+                "is_cloud_file": True, "is_local": False, "destination_id": "id-1",
+                "size": 9, "dest_path": "library/a",
+            },
+            expected_size=10, expected_dest="library/a", expected_fingerprint=None,
+        ), "reject")
 
 
 if __name__ == "__main__":

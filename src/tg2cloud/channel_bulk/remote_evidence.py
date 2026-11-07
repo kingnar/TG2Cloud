@@ -1,16 +1,14 @@
 """Fail-closed remote acceptance.
 
-CloudDrive2 documents a gRPC upload list, ``GetUploadFileList``
-(``UploadFileInfo``: destPath, size, transferredBytes, status Finish=5).
-That record is the gateway's own task flag. It has no source content hash and
-no downstream cloud file id. ``FindFileByPath`` can return ``CloudDriveFile.id``,
-but the same API is allowed to answer from directory cache. ``isCloudFile``
-means the path is a cloud node, not that the bytes have left the local buffer.
+WebDAV size is never success. CloudDrive2 upload-task ``Finish`` is never
+success either: that flag has no destination file id. The only accept path is
+a file read-back (``GetSubFiles`` with ``forceRefresh``) that returns
+``CloudDriveFile.id``, a matching size, ``isCloudFile``, and ``isLocal=false``.
 
-The process only has WebDAV settings. WebDAV size is the cache-facing check and
-is never acceptance. This module does not log in, does not read a token, and
-does not call the gateway. A later verifier may supply an observation only
-after a real post-Finish read-back; until then bulk upload stays retained.
+``CloudDriveFile.fileHashes`` may include MD5 or SHA1. It does not include the
+local head/mid/tail sample SHA-256, so that sample is not compared. If an
+observation nevertheless carries ``content_sha256``, it must match the local
+sample or the read-back is rejected.
 """
 from __future__ import annotations
 
@@ -24,22 +22,22 @@ def assess(
     expected_dest: str,
     expected_fingerprint: str | None,
 ) -> str:
-    """Return ``accept`` only for a complete post-upload read-back. Otherwise ``reject``."""
+    """Return ``accept`` only for a cloud file id read-back. Otherwise ``reject``."""
     if not isinstance(observation, dict):
         return "reject"
-    if observation.get("scheme") == "webdav" or observation.get("method") == "size":
+    if observation.get("scheme") in {"webdav", "clouddrive2-upload-task"} or observation.get("method") == "size":
         return "reject"
-    if observation.get("cache_only") is not False or observation.get("read_back") is not True:
+    if observation.get("scheme") != "clouddrive2-file":
         return "reject"
-    if observation.get("scheme") != "clouddrive2-upload-task" or observation.get("status") != "Finish":
+    if observation.get("read_back") is not True or observation.get("cache_only") is not False:
         return "reject"
-    if not expected_fingerprint or observation.get("source_fingerprint") != expected_fingerprint:
+    if observation.get("is_cloud_file") is not True or observation.get("is_local") is not False:
         return "reject"
     destination_id = observation.get("destination_id")
     if (
         not isinstance(destination_id, str)
         or not destination_id
-        or len(destination_id) > 128
+        or len(destination_id) > 256
         or any(ord(char) < 32 for char in destination_id)
     ):
         return "reject"
@@ -47,9 +45,10 @@ def assess(
         return "reject"
     try:
         size = int(observation.get("size"))
-        moved = int(observation.get("transferred_bytes"))
     except (TypeError, ValueError):
         return "reject"
-    if size != int(expected_size) or moved != size or size < 0:
+    if size != int(expected_size) or size < 0:
+        return "reject"
+    if "content_sha256" in observation and observation.get("content_sha256") != expected_fingerprint:
         return "reject"
     return "accept"

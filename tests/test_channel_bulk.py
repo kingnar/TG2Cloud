@@ -94,15 +94,14 @@ class Transport:
         if not self.evidence:
             return {"size": size, "cache_only": self.cache_only, "scheme": "webdav", "method": "size"}
         return {
-            "scheme": "clouddrive2-upload-task",
-            "status": "Finish",
-            "size": size,
-            "transferred_bytes": size,
-            "dest_path": remote,
-            "source_fingerprint": fingerprint,
-            "destination_id": "cloud-file",
+            "scheme": "clouddrive2-file",
             "read_back": True,
             "cache_only": False,
+            "is_cloud_file": True,
+            "is_local": False,
+            "size": size,
+            "dest_path": remote,
+            "destination_id": "cloud-file",
         }
 
 

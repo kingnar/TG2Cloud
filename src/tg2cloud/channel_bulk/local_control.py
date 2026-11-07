@@ -34,12 +34,14 @@ _COMMANDS = {
     "inventory.review",
     "bulk.preview",
     "bulk.status",
+    "remote.verify",
     "ping",
 }
 
 
 def redact(text: str) -> str:
     cleaned = _SECRET.sub(r"\1\2[REDACTED]", text or "")
+    cleaned = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [REDACTED]", cleaned)
     cleaned = re.sub(r"https?://\S+", "[URL]", cleaned)
     return cleaned[:400]
 
@@ -344,6 +346,8 @@ class LocalControl:
         if command == "bulk.status":
             job = jobs.get_job(self.owner.db, _number(request.get("job_id"), "job"))
             return {"ok": True, "job_id": job["id"], "status": job["state"]}
+        if command == "remote.verify":
+            return await self._verify(request)
         return {"ok": False, "error": "bad-request"}
 
     async def _run_inventory(self, request: dict) -> dict:
@@ -423,6 +427,38 @@ class LocalControl:
             async with self._flag:
                 self._scanning = False
         return {key: value for key, value in result.items() if key != "caption"}
+
+    async def _verify(self, request: dict) -> dict:
+        from tg2cloud.channel_bulk.cd2api import read_back, safe_relative
+        from tg2cloud.channel_bulk.remote_evidence import assess
+
+        paths = request.get("paths")
+        sizes = request.get("sizes")
+        if (
+            not isinstance(paths, list)
+            or not isinstance(sizes, list)
+            or not 1 <= len(paths) <= 5
+            or len(paths) != len(sizes)
+        ):
+            raise ValueError("bad-request")
+        items = []
+        for path, size in zip(paths, sizes):
+            if not safe_relative(path) or type(size) is not int or isinstance(size, bool) or size < 0:
+                raise ValueError("bad-request")
+            observed = await read_back(path, expected_size=size)
+            items.append({
+                "accepted": assess(
+                    observed, expected_size=size, expected_dest=path, expected_fingerprint=None,
+                ) == "accept",
+                "has_file_id": bool(observed.get("destination_id")),
+                "size_ok": observed.get("size") == size,
+            })
+        return {
+            "ok": True,
+            "checked": len(items),
+            "matched": sum(1 for item in items if item["accepted"]),
+            "items": items,
+        }
 
 
 def _number(value, name: str) -> int:

@@ -55,13 +55,11 @@ async def upload_bounded(rclone, path: Path, remote: str, rate) -> None:
 
 
 async def probe_remote(rclone, remote: str) -> dict:
-    """Size plus an explicit cache flag. Unknown cache is not success."""
-    size = await rclone.remote_size(remote)
-    checker = getattr(rclone, "cache_only", None)
-    flag = await checker(remote) if callable(checker) else None
-    if flag is not None and not isinstance(flag, bool):
-        flag = None
-    return {"size": int(size), "cache_only": flag}
+    """Ask the CloudDrive2 file API. WebDAV size is not a result."""
+    del rclone
+    from tg2cloud.channel_bulk.cd2api import read_back
+
+    return await read_back(remote)
 
 
 class ListenerTransport:
