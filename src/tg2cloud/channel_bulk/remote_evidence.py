@@ -17,6 +17,7 @@ A listing ``timeout`` is not a missing file.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 ATTEST_ENV = "TG2CLOUD_CD2_UPLOAD_ATTEST"
@@ -69,6 +70,38 @@ def _short(value: Any, limit: int) -> str:
     return str(value or "")[:limit]
 
 
+_UPLOAD_ERRORS = {"", "empty", "timeout", "status", "no-status", "protocol"}
+_FRAMES = re.compile(r"[0-9]{1,3}:[0-9]{1,3}(?:,[0-9]{1,3}:[0-9]{1,3}){0,7}")
+
+
+def _grpc_status(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.isdigit() and len(text) <= 2 and text != "0":
+        return text
+    return ""
+
+
+def _frames(value: Any) -> str:
+    text = str(value or "")
+    if _FRAMES.fullmatch(text):
+        return text
+    return ""
+
+
+def _flag(observed: dict, key: str):
+    if key not in observed or observed[key] is None:
+        return None
+    if type(observed[key]) is not bool:
+        return None
+    return observed[key]
+
+
+def _millis(value: Any):
+    if type(value) is not int or isinstance(value, bool) or not 0 <= value <= 600_000:
+        return None
+    return value
+
+
 def _attempts(value: Any) -> int:
     if type(value) is not int or isinstance(value, bool) or value < 0:
         return 0
@@ -108,6 +141,12 @@ def verification_report(observed: dict, *, size: int, dest: str, attest: bool = 
         "upload_list": _short(observed.get("upload_list") or "not_asked", 32),
         "upload_rpc": _short(observed.get("upload_rpc"), 64),
         "upload_attempts": _attempts(observed.get("upload_attempts")),
-        "upload_error": _short(observed.get("upload_error"), 16),
+        "upload_error": observed.get("upload_error") if observed.get("upload_error") in _UPLOAD_ERRORS else "protocol",
+        "upload_status": _grpc_status(observed.get("upload_status")),
+        "upload_status_present": _flag(observed, "upload_status_present"),
+        "upload_end_stream": _flag(observed, "upload_end_stream"),
+        "upload_frames": _frames(observed.get("upload_frames")),
+        "upload_saw_frame": _flag(observed, "upload_saw_frame"),
+        "upload_ms": _millis(observed.get("upload_ms")),
         "file_id": file_id[:256],
     }

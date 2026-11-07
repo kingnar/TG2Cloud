@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import unittest
 from pathlib import Path
@@ -205,6 +206,81 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blob, b"")
         self.assertEqual(parse_upload_count(blob), 0)
 
+    async def test_nonzero_status_is_not_idle_and_diagnostics_drop_secrets(self):
+        from tg2cloud.channel_bulk.cd2api import _PREFACE, GrpcCallError, _frame
+        from tg2cloud.channel_bulk.remote_evidence import verification_report
+
+        secret = "Bearer hidden /private/path file-id-secret"
+
+        async def serve(reader, writer):
+            await reader.readexactly(len(_PREFACE))
+            while True:
+                header = await reader.readexactly(9)
+                length = int.from_bytes(header[:3], "big")
+                flags = header[4]
+                ftype = header[3]
+                if length:
+                    await reader.readexactly(length)
+                if ftype == 0 and flags & 1:
+                    break
+            writer.write(_frame(0x4, 0, 0, b""))
+            writer.write(_frame(0x1, 0x4, 1, _literal(":status", "200")))
+            writer.write(_frame(0x1, 0x5, 1, _literal("grpc-status", "12") + _literal("grpc-message", secret)))
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            with self.assertRaises(GrpcCallError) as caught:
+                await grpc_unary(
+                    "127.0.0.1", port, "GetUploadFileCount", b"", "test-token",
+                    tls=False, idle_seconds=2, call_seconds=3,
+                )
+        finally:
+            server.close()
+            await server.wait_closed()
+        error = caught.exception
+        self.assertEqual(error.kind, "status")
+        self.assertEqual(error.status, "12")
+        self.assertTrue(error.end_stream)
+        self.assertTrue(error.status_present)
+        self.assertNotIn("hidden", str(error))
+        self.assertNotIn("private", error.frames)
+        self.assertTrue(error.frames.startswith("4:"))
+
+        async def rpc(method, payload):
+            del payload
+            if method == "FindFileByPath":
+                return _raw_file("file-1", "clip.mp4", 10)
+            raise error
+
+        observed = await read_back(
+            "library/clip.mp4", expected_size=10, rpc=rpc, sleep=_no_sleep, rng=lambda: 0,
+        )
+        self.assertEqual(observed["upload_list"], "unsupported")
+        self.assertNotEqual(assess(
+            observed, expected_size=10, expected_dest="library/clip.mp4", expected_fingerprint=None,
+        ), "accept")
+        report = verification_report(observed, size=10, dest="library/clip.mp4")
+        self.assertEqual(report["upload_error"], "status")
+        self.assertEqual(report["upload_status"], "12")
+        self.assertTrue(report["upload_status_present"])
+        self.assertTrue(report["upload_end_stream"])
+        self.assertNotIn("hidden", json.dumps({
+            key: report[key] for key in report if key != "file_id"
+        }))
+        poisoned = verification_report({
+            **observed,
+            "upload_status": secret,
+            "upload_frames": secret,
+            "upload_error": secret,
+        }, size=10, dest="library/clip.mp4")
+        self.assertEqual(poisoned["upload_status"], "")
+        self.assertEqual(poisoned["upload_frames"], "")
+        self.assertEqual(poisoned["upload_error"], "protocol")
+        self.assertFalse(poisoned["accepted"])
+
         async def silent(reader, writer):
             try:
                 await reader.readexactly(len(_PREFACE))
@@ -216,7 +292,7 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
         stalled = await asyncio.start_server(silent, "127.0.0.1", 0)
         stalled_port = stalled.sockets[0].getsockname()[1]
         try:
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(GrpcCallError) as stalled_call:
                 await grpc_unary(
                     "127.0.0.1", stalled_port, "GetUploadFileCount", b"", "test-token",
                     tls=False, idle_seconds=0.2, call_seconds=0.4,
@@ -224,6 +300,11 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
         finally:
             stalled.close()
             await stalled.wait_closed()
+        self.assertEqual(stalled_call.exception.kind, "timeout")
+        self.assertEqual(stalled_call.exception.status, "")
+        self.assertFalse(stalled_call.exception.end_stream)
+        self.assertFalse(stalled_call.exception.status_present)
+        self.assertFalse(stalled_call.exception.saw_frame)
 
     async def test_verify_command_rejects_escape_and_missing_token(self):
         import tempfile

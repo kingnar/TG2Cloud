@@ -34,6 +34,7 @@ import posixpath
 import random
 import re
 import ssl
+import time
 from typing import Any
 
 HUFFMAN=[(8184, 13), (8388568, 23), (268435426, 28), (268435427, 28), (268435428, 28), (268435429, 28), (268435430, 28), (268435431, 28), (268435432, 28), (16777194, 24), (1073741820, 30), (268435433, 28), (268435434, 28), (1073741821, 30), (268435435, 28), (268435436, 28), (268435437, 28), (268435438, 28), (268435439, 28), (268435440, 28), (268435441, 28), (268435442, 28), (1073741822, 30), (268435443, 28), (268435444, 28), (268435445, 28), (268435446, 28), (268435447, 28), (268435448, 28), (268435449, 28), (268435450, 28), (268435451, 28), (20, 6), (1016, 10), (1017, 10), (4090, 12), (8185, 13), (21, 6), (248, 8), (2042, 11), (1018, 10), (1019, 10), (249, 8), (2043, 11), (250, 8), (22, 6), (23, 6), (24, 6), (0, 5), (1, 5), (2, 5), (25, 6), (26, 6), (27, 6), (28, 6), (29, 6), (30, 6), (31, 6), (92, 7), (251, 8), (32764, 15), (32, 6), (4091, 12), (1020, 10), (8186, 13), (33, 6), (93, 7), (94, 7), (95, 7), (96, 7), (97, 7), (98, 7), (99, 7), (100, 7), (101, 7), (102, 7), (103, 7), (104, 7), (105, 7), (106, 7), (107, 7), (108, 7), (109, 7), (110, 7), (111, 7), (112, 7), (113, 7), (114, 7), (252, 8), (115, 7), (253, 8), (8187, 13), (524272, 19), (8188, 13), (16380, 14), (34, 6), (32765, 15), (3, 5), (35, 6), (4, 5), (36, 6), (5, 5), (37, 6), (38, 6), (39, 6), (6, 5), (116, 7), (117, 7), (40, 6), (41, 6), (42, 6), (7, 5), (43, 6), (118, 7), (44, 6), (8, 5), (9, 5), (45, 6), (119, 7), (120, 7), (121, 7), (122, 7), (123, 7), (32766, 15), (2044, 11), (16381, 14), (8189, 13), (268435452, 28), (1048550, 20), (4194258, 22), (1048551, 20), (1048552, 20), (4194259, 22), (4194260, 22), (4194261, 22), (8388569, 23), (4194262, 22), (8388570, 23), (8388571, 23), (8388572, 23), (8388573, 23), (8388574, 23), (16777195, 24), (8388575, 23), (16777196, 24), (16777197, 24), (4194263, 22), (8388576, 23), (16777198, 24), (8388577, 23), (8388578, 23), (8388579, 23), (8388580, 23), (2097116, 21), (4194264, 22), (8388581, 23), (4194265, 22), (8388582, 23), (8388583, 23), (16777199, 24), (4194266, 22), (2097117, 21), (1048553, 20), (4194267, 22), (4194268, 22), (8388584, 23), (8388585, 23), (2097118, 21), (8388586, 23), (4194269, 22), (4194270, 22), (16777200, 24), (2097119, 21), (4194271, 22), (8388587, 23), (8388588, 23), (2097120, 21), (2097121, 21), (4194272, 22), (2097122, 21), (8388589, 23), (4194273, 22), (8388590, 23), (8388591, 23), (1048554, 20), (4194274, 22), (4194275, 22), (4194276, 22), (8388592, 23), (4194277, 22), (4194278, 22), (8388593, 23), (67108832, 26), (67108833, 26), (1048555, 20), (524273, 19), (4194279, 22), (8388594, 23), (4194280, 22), (33554412, 25), (67108834, 26), (67108835, 26), (67108836, 26), (134217694, 27), (134217695, 27), (67108837, 26), (16777201, 24), (33554413, 25), (524274, 19), (2097123, 21), (67108838, 26), (134217696, 27), (134217697, 27), (67108839, 26), (134217698, 27), (16777202, 24), (2097124, 21), (2097125, 21), (67108840, 26), (67108841, 26), (268435453, 28), (134217699, 27), (134217700, 27), (134217701, 27), (1048556, 20), (16777203, 24), (1048557, 20), (2097126, 21), (4194281, 22), (2097127, 21), (2097128, 21), (8388595, 23), (4194282, 22), (4194283, 22), (33554414, 25), (33554415, 25), (16777204, 24), (16777205, 24), (67108842, 26), (8388596, 23), (67108843, 26), (134217702, 27), (67108844, 26), (67108845, 26), (134217703, 27), (134217704, 27), (134217705, 27), (134217706, 27), (134217707, 27), (268435454, 28), (134217708, 27), (134217709, 27), (134217710, 27), (134217711, 27), (134217712, 27), (67108846, 26), (1073741823, 30)]
@@ -405,6 +406,45 @@ _STATIC = {
 }
 
 
+class GrpcCallError(Exception):
+    """A finished or broken gRPC call. The text is only the class name."""
+
+    def __init__(
+        self,
+        kind: str,
+        status: str = "",
+        *,
+        frames: tuple = (),
+        end_stream: bool = False,
+        status_present: bool = False,
+        saw_frame: bool = False,
+    ) -> None:
+        self.kind = kind if kind in {"timeout", "status", "no-status", "protocol"} else "protocol"
+        self.status = _grpc_code(status) if self.kind == "status" else ""
+        if self.kind == "status" and not self.status:
+            self.kind = "protocol"
+        self.end_stream = bool(end_stream)
+        self.status_present = bool(status_present)
+        self.saw_frame = bool(saw_frame)
+        safe = []
+        for item in list(frames)[:8]:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and all(type(part) is int and not isinstance(part, bool) and 0 <= part <= 255 for part in item)
+            ):
+                safe.append(f"{item[0]}:{item[1]}")
+        self.frames = ",".join(safe)
+        super().__init__(self.kind)
+
+
+def _grpc_code(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.isdigit() and 1 <= len(text) <= 2:
+        return text
+    return ""
+
+
 def _frame(ftype: int, flags: int, stream: int, payload: bytes) -> bytes:
     if len(payload) > 16384:
         raise ValueError("frame")
@@ -434,65 +474,99 @@ async def grpc_unary(
     idle = idle_timeout() if idle_seconds is None else idle_seconds
     deadline = call_timeout() if call_seconds is None else call_seconds
 
-    async def _once() -> bytes:
-        context = ssl.create_default_context() if tls else None
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, ssl=context), min(15.0, idle),
-        )
-        try:
-            headers = _request_headers(f"{host}:{port}", method, token)
-            body = b"\x00" + len(payload).to_bytes(4, "big") + payload
-            window = (4).to_bytes(2, "big") + (1024 * 1024).to_bytes(4, "big")
-            writer.write(_PREFACE)
-            writer.write(_frame(0x4, 0, 0, window))
-            writer.write(_frame(0x8, 0, 0, (1024 * 1024).to_bytes(4, "big")))
-            writer.write(_frame(0x1, 0x4, 1, headers))
-            writer.write(_frame(0x0, 0x1, 1, body))
-            await writer.drain()
-            data = bytearray()
-            status = None
-            pending = 0
-            while True:
-                ftype, flags, stream, frame = await asyncio.wait_for(_read_frame(reader), idle)
-                if ftype == 0x4 and not flags & 0x1:
-                    writer.write(_frame(0x4, 0x1, 0, b""))
-                    await writer.drain()
-                elif ftype == 0x6 and not flags & 0x1:
-                    writer.write(_frame(0x6, 0x1, 0, frame[:8]))
-                    await writer.drain()
-                elif ftype in {0x1, 0x9}:
-                    decoded = _decode_headers(frame)
-                    if "grpc-status" in decoded:
-                        status = decoded["grpc-status"]
-                elif ftype == 0x0 and stream == 1:
-                    data += frame
-                    pending += len(frame)
-                    if pending >= 32768:
-                        credit = pending.to_bytes(4, "big")
-                        writer.write(_frame(0x8, 0, 0, credit))
-                        writer.write(_frame(0x8, 0, 1, credit))
-                        await writer.drain()
-                        pending = 0
-                elif ftype == 0x7:
-                    raise ValueError("goaway")
-                # A count of zero is an empty protobuf. gRPC then ends the
-                # stream on the trailer HEADERS and may send no DATA frame.
-                # Waiting for DATA turns that idle queue into a timeout.
-                if ftype in {0x0, 0x1, 0x9} and flags & 0x1:
-                    break
-            if status not in {None, "0"}:
-                raise ValueError("grpc-status")
-            if not data and status is None:
-                raise ValueError("grpc-status")
-            return bytes(data)
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception as exc:  # noqa: BLE001 - closing a finished stream is not a verification result
-                del exc
+    frames: list[tuple[int, int]] = []
+    status = None
+    status_present = False
+    end_stream = False
+    saw_frame = False
 
-    return await asyncio.wait_for(_once(), deadline)
+    def fail(kind: str, code: str = "") -> None:
+        raise GrpcCallError(
+            kind, code, frames=tuple(frames), end_stream=end_stream,
+            status_present=status_present, saw_frame=saw_frame,
+        )
+
+    deadline_at = time.monotonic() + deadline
+    context = ssl.create_default_context() if tls else None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=context), min(15.0, idle, deadline),
+        )
+    except TimeoutError:
+        fail("timeout")
+    try:
+        headers = _request_headers(f"{host}:{port}", method, token)
+        body = b"\x00" + len(payload).to_bytes(4, "big") + payload
+        window = (4).to_bytes(2, "big") + (1024 * 1024).to_bytes(4, "big")
+        writer.write(_PREFACE)
+        writer.write(_frame(0x4, 0, 0, window))
+        writer.write(_frame(0x8, 0, 0, (1024 * 1024).to_bytes(4, "big")))
+        writer.write(_frame(0x1, 0x4, 1, headers))
+        writer.write(_frame(0x0, 0x1, 1, body))
+        await writer.drain()
+        data = bytearray()
+        pending = 0
+        while True:
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                fail("timeout")
+            try:
+                ftype, flags, stream, frame = await asyncio.wait_for(
+                    _read_frame(reader), min(idle, remaining),
+                )
+            except TimeoutError:
+                fail("timeout")
+            saw_frame = True
+            if len(frames) < 8:
+                frames.append((int(ftype), int(flags)))
+            if ftype in {0x0, 0x1, 0x9} and flags & 0x1:
+                end_stream = True
+            if ftype == 0x4 and not flags & 0x1:
+                writer.write(_frame(0x4, 0x1, 0, b""))
+                await writer.drain()
+            elif ftype == 0x6 and not flags & 0x1:
+                writer.write(_frame(0x6, 0x1, 0, frame[:8]))
+                await writer.drain()
+            elif ftype in {0x1, 0x9}:
+                try:
+                    decoded = _decode_headers(frame)
+                except Exception as exc:
+                    raise GrpcCallError(
+                        "protocol", frames=tuple(frames), end_stream=end_stream,
+                        status_present=status_present, saw_frame=True,
+                    ) from exc
+                if "grpc-status" in decoded:
+                    status_present = True
+                    status = _grpc_code(decoded.get("grpc-status"))
+            elif ftype == 0x0 and stream == 1:
+                data += frame
+                pending += len(frame)
+                if pending >= 32768:
+                    credit = pending.to_bytes(4, "big")
+                    writer.write(_frame(0x8, 0, 0, credit))
+                    writer.write(_frame(0x8, 0, 1, credit))
+                    await writer.drain()
+                    pending = 0
+            elif ftype == 0x7:
+                fail("protocol")
+            # A count of zero is an empty protobuf. gRPC then ends the
+            # stream on the trailer HEADERS and may send no DATA frame.
+            # Waiting for DATA turns that idle queue into a timeout.
+            if end_stream:
+                break
+        if status_present and status not in {None, "0"}:
+            fail("status", status or "")
+        if status_present and not status:
+            fail("protocol")
+        if not data and status != "0":
+            fail("no-status")
+        return bytes(data)
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception as exc:  # noqa: BLE001 - closing a finished stream is not a verification result
+            del exc
 
 
 def _join(root: str, relative: str) -> str:
@@ -557,6 +631,7 @@ def _observation(
         "upload_rpc": upload_rpc,
         "upload_attempts": upload_attempts,
         "upload_error": upload_error,
+        "upload_status": "",
     }
 
 
@@ -565,22 +640,43 @@ class _Call:
         self.value: bytes | None = None
         self.attempts = 0
         self.error = ""
+        self.status = ""
+        self.frames = ""
+        self.end_stream = None
+        self.status_present = None
+        self.saw_frame = None
+        self.ms = None
 
 
 async def _retry(call, method: str, payload: bytes, *, attempts: int, base: float, sleep, rng) -> _Call:
     result = _Call()
     for attempt in range(attempts):
         result.attempts = attempt + 1
+        started = time.monotonic()
         try:
             result.value = await call(method, payload)
             result.error = ""
+            result.status = ""
+            result.ms = int((time.monotonic() - started) * 1000)
             return result
-        except Exception as exc:  # noqa: BLE001 - one attempt is not the final result
-            result.error = "timeout" if isinstance(exc, TimeoutError) else "rpc"
-            if attempt + 1 >= attempts:
-                return result
-            delay = min(base * (2 ** attempt), 8.0) * (0.5 + float(rng()))
-            await sleep(delay)
+        except TimeoutError:
+            result.error = "timeout"
+            result.status = ""
+        except GrpcCallError as exc:
+            result.error = exc.kind
+            result.status = exc.status
+            result.frames = exc.frames
+            result.end_stream = exc.end_stream
+            result.status_present = exc.status_present
+            result.saw_frame = exc.saw_frame
+        except Exception:  # noqa: BLE001 - keep only the class, never the message text
+            result.error = "protocol"
+            result.status = ""
+        result.ms = int((time.monotonic() - started) * 1000)
+        if attempt + 1 >= attempts:
+            return result
+        delay = min(base * (2 ** attempt), 8.0) * (0.5 + float(rng()))
+        await sleep(delay)
     return result
 
 
@@ -629,6 +725,21 @@ def _busy(items: list[dict[str, Any]], name: str, full: str) -> bool:
     )
 
 
+def _upload_failure(state: str, rpc_name: str, call: _Call) -> dict[str, Any]:
+    return {
+        "state": state,
+        "upload_rpc": rpc_name,
+        "upload_attempts": call.attempts,
+        "upload_error": call.error,
+        "upload_status": call.status,
+        "upload_status_present": call.status_present,
+        "upload_end_stream": call.end_stream,
+        "upload_frames": call.frames,
+        "upload_saw_frame": call.saw_frame,
+        "upload_ms": call.ms,
+    }
+
+
 async def _upload_state(call, name: str, full: str, *, attempts: int, base: float, sleep, rng) -> dict[str, Any]:
     """Active queue only. A name-filtered page is not requested."""
     count = await _retry(
@@ -636,12 +747,7 @@ async def _upload_state(call, name: str, full: str, *, attempts: int, base: floa
         attempts=attempts, base=base, sleep=sleep, rng=rng,
     )
     if count.error:
-        return {
-            "state": "unsupported",
-            "upload_rpc": "GetUploadFileCount",
-            "upload_attempts": count.attempts,
-            "upload_error": count.error,
-        }
+        return _upload_failure("unsupported", "GetUploadFileCount", count)
     if parse_upload_count(count.value or b"") == 0:
         return {
             "state": "clear",
@@ -654,12 +760,7 @@ async def _upload_state(call, name: str, full: str, *, attempts: int, base: floa
         attempts=attempts, base=base, sleep=sleep, rng=rng,
     )
     if listed.error:
-        return {
-            "state": "inconclusive",
-            "upload_rpc": "GetUploadFileList",
-            "upload_attempts": listed.attempts,
-            "upload_error": listed.error,
-        }
+        return _upload_failure("inconclusive", "GetUploadFileList", listed)
     items = uploads_from_list(listed.value or b"")
     return {
         "state": "busy" if _busy(items, name, full) else "clear",
@@ -720,9 +821,16 @@ async def read_back(
     upload = await _upload_state(
         rpc, name, str(full), attempts=attempts, base=base, sleep=pause, rng=roll,
     )
-    return _observation(
+    observation = _observation(
         relative_path, info, listing="ok", upload_list=upload["state"], proven=upload["state"] == "clear",
         listing_rpc=listing_rpc, listing_attempts=listing_attempts, listing_error=listing_error,
         upload_rpc=upload["upload_rpc"], upload_attempts=upload["upload_attempts"],
         upload_error=upload["upload_error"],
     )
+    for key in (
+        "upload_status", "upload_status_present", "upload_end_stream",
+        "upload_frames", "upload_saw_frame", "upload_ms",
+    ):
+        if key in upload:
+            observation[key] = upload[key]
+    return observation
