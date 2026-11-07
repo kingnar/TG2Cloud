@@ -31,6 +31,7 @@ _COMMANDS = {
     "inventory.status",
     "inventory.export",
     "inventory.cancel",
+    "inventory.review",
     "bulk.preview",
     "bulk.status",
     "ping",
@@ -207,7 +208,9 @@ class LocalControl:
             except (UnicodeError, json.JSONDecodeError):
                 await self._reply(writer, {"ok": False, "error": "bad-request"}, peer, "", "")
                 return
-            if not isinstance(request, dict) or request.keys() & {"path", "file", "code", "token"}:
+            if not isinstance(request, dict) or request.keys() & {
+                "path", "file", "code", "token", "output", "directory", "caption", "title",
+            }:
                 await self._reply(writer, {"ok": False, "error": "bad-request"}, peer, "", "")
                 return
             command = request.get("command")
@@ -329,6 +332,8 @@ class LocalControl:
             return {"ok": True, "inventory_id": inventory_id, "status": "paused"}
         if command == "inventory.run":
             return await self._run_inventory(request)
+        if command == "inventory.review":
+            return await self._review(request)
         if command == "bulk.preview":
             inventory_id = _number(request.get("inventory_id"), "inventory")
             alias = request.get("alias")
@@ -379,6 +384,45 @@ class LocalControl:
 
         row = inventory.load(self.owner.db, inventory_id)
         return await _fetch(self.owner, int(row["chat_id"]), offset, limit)
+
+    async def _review(self, request: dict) -> dict:
+        from tg2cloud.channel_bulk.review import (
+            MAX_IDS,
+            MAX_SECONDS,
+            MAX_TOTAL_BYTES,
+            collect,
+            reader_for,
+        )
+
+        inventory_id = _number(request.get("inventory_id"), "inventory")
+        raw_ids = request.get("message_ids")
+        if not isinstance(raw_ids, list) or not 1 <= len(raw_ids) <= MAX_IDS:
+            raise ValueError("bad-request")
+        message_ids = [_number(item, "message") for item in raw_ids]
+        if len(set(message_ids)) != len(message_ids):
+            raise ValueError("bad-request")
+        max_seconds = _bound(request.get("max_seconds"), default=60, upper=MAX_SECONDS)
+        max_total = _bound(request.get("max_total_bytes"), default=1024 * 1024, upper=MAX_TOTAL_BYTES)
+        async with self._flag:
+            if self._scanning:
+                return {"ok": False, "error": "busy", "inventory_id": inventory_id}
+            self._scanning = True
+        try:
+            result = await collect(
+                self.owner.db,
+                Path(self.owner.settings.data_dir),
+                inventory_id,
+                message_ids,
+                reader_for(self.owner),
+                now=time.time,
+                sleep=asyncio.sleep,
+                max_seconds=max_seconds,
+                max_total_bytes=max_total,
+            )
+        finally:
+            async with self._flag:
+                self._scanning = False
+        return {key: value for key, value in result.items() if key != "caption"}
 
 
 def _number(value, name: str) -> int:
