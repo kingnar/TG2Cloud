@@ -3,8 +3,11 @@
 Documented service ``clouddrive.CloudDriveFileSrv`` (proto version 1.0.11).
 A known file is read with ``FindFileByPath``, then ``GetSearchResults``
 (``fuzzyMatch`` false), then ``GetSubFiles`` with ``forceRefresh``.
-``GetUploadFileList`` is filtered by file name and paged (``itemsPerPage``,
-``pageNumber``). ``getAll`` is not used. Authorization is ``Bearer`` from
+The active upload queue is ``GetUploadFileCount``. Zero means nothing is
+uploading. ``GetUploadFileList`` is used only when that count is non-zero, and
+only as ``getAll`` (field 1 = true). A name filter plus page is not sent: on
+this gateway that shape times out even when the panel queue is idle.
+Authorization is ``Bearer`` from
 ``TG2CLOUD_CD2_API_TOKEN``. Address ``TG2CLOUD_CD2_API_ADDRESS`` defaults to
 ``127.0.0.1:19798``. Optional prefix ``TG2CLOUD_CD2_API_ROOT``. TLS when
 ``TG2CLOUD_CD2_API_TLS=1``.
@@ -16,11 +19,12 @@ Timing: ``TG2CLOUD_CD2_API_TIMEOUT_SECONDS`` (idle, default 60, range 5–120),
 
 ``CloudDriveFile.id`` plus size, ``isCloudFile``, and ``isLocal=false`` is the
 file evidence. ``fileHashes`` may contain MD5 or SHA1, not the local sample
-SHA-256, so that sample is not compared. After those retries, an upload-list
-timeout is ``upload_list_inconclusive``: the file id stays visible to
-``remote.verify``, and bulk success stays rejected. A completed listing that
-does not contain the name is ``missing``. A transport failure of every lookup
-is ``timeout``, which is not the same as a missing file.
+SHA-256, so that sample is not compared. An empty upload count is
+``upload_list=clear``. If the count itself fails, the result is
+``upload_list=unsupported`` and bulk success stays rejected. ``remote.verify``
+can accept that case only when ``TG2CLOUD_CD2_UPLOAD_ATTEST=1`` and the request
+sets ``upload_attest`` true. A completed directory list that does not contain
+the name is ``missing``. A transport failure of every lookup is ``timeout``.
 """
 from __future__ import annotations
 
@@ -43,8 +47,6 @@ CALL_ENV = "TG2CLOUD_CD2_API_CALL_SECONDS"
 RETRY_ENV = "TG2CLOUD_CD2_API_RETRIES"
 BACKOFF_ENV = "TG2CLOUD_CD2_API_RETRY_BASE_SECONDS"
 DEFAULT_ADDRESS = "127.0.0.1:19798"
-_PAGE_SIZE = 50
-_MAX_PAGES = 4
 _ADDRESS = re.compile(r"^[A-Za-z0-9._-]{1,253}:([0-9]{1,5})$")
 _PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 _IN_PROGRESS = {0, 1, 3, 4, 7, 9, 10}
@@ -159,9 +161,9 @@ def encode_find(parent: str, name: str) -> bytes:
     return _field(1, 2, parent.encode()) + _field(2, 2, name.encode())
 
 
-def encode_upload_page(name: str, page: int, per_page: int = _PAGE_SIZE) -> bytes:
-    """One filtered page. ``getAll`` is left false so the gateway does not dump every task."""
-    return _field(2, 0, _varint(per_page)) + _field(3, 0, _varint(page)) + _field(4, 2, name.encode())
+def encode_upload_all() -> bytes:
+    """Live queue. ``08 01`` is getAll=true and does not ask the gateway to scan history by name."""
+    return _field(1, 0, b"\x01")
 
 
 def parse_fields(buf: bytes) -> list[tuple[int, int, bytes]]:
@@ -268,18 +270,14 @@ def uploads_from_list(blob: bytes) -> list[dict[str, Any]]:
     return found
 
 
-def parse_upload_page(blob: bytes) -> tuple[list[dict[str, Any]], int | None, int | None]:
-    items: list[dict[str, Any]] = []
-    total = filtered = None
+def parse_upload_count(blob: bytes) -> int:
+    """Field 1 is the active upload count. An empty message means zero."""
+    count = 0
     for message in parse_messages(blob):
         for number, wire, payload in parse_fields(message):
             if number == 1 and wire == 0:
-                total, _ = _read_varint(payload, 0)
-            elif number == 6 and wire == 0:
-                filtered, _ = _read_varint(payload, 0)
-            elif number == 2 and wire == 2:
-                items.append(_upload_item(payload))
-    return items, total, filtered
+                count, _ = _read_varint(payload, 0)
+    return count
 
 
 def file_from_unary(blob: bytes) -> dict[str, Any] | None:
@@ -444,13 +442,16 @@ async def grpc_unary(
         try:
             headers = _request_headers(f"{host}:{port}", method, token)
             body = b"\x00" + len(payload).to_bytes(4, "big") + payload
+            window = (4).to_bytes(2, "big") + (1024 * 1024).to_bytes(4, "big")
             writer.write(_PREFACE)
-            writer.write(_frame(0x4, 0, 0, b""))
+            writer.write(_frame(0x4, 0, 0, window))
+            writer.write(_frame(0x8, 0, 0, (1024 * 1024).to_bytes(4, "big")))
             writer.write(_frame(0x1, 0x4, 1, headers))
             writer.write(_frame(0x0, 0x1, 1, body))
             await writer.drain()
             data = bytearray()
             status = None
+            pending = 0
             while True:
                 ftype, flags, stream, frame = await asyncio.wait_for(_read_frame(reader), idle)
                 if ftype == 0x4 and not flags & 0x1:
@@ -465,6 +466,13 @@ async def grpc_unary(
                         status = decoded["grpc-status"]
                 elif ftype == 0x0 and stream == 1:
                     data += frame
+                    pending += len(frame)
+                    if pending >= 32768:
+                        credit = pending.to_bytes(4, "big")
+                        writer.write(_frame(0x8, 0, 0, credit))
+                        writer.write(_frame(0x8, 0, 1, credit))
+                        await writer.drain()
+                        pending = 0
                 elif ftype == 0x7:
                     raise ValueError("goaway")
                 if ftype == 0x0 and flags & 0x1:
@@ -521,6 +529,12 @@ def _observation(
     listing: str,
     upload_list: str,
     proven: bool,
+    listing_rpc: str = "",
+    listing_attempts: int = 0,
+    listing_error: str = "",
+    upload_rpc: str = "",
+    upload_attempts: int = 0,
+    upload_error: str = "",
 ) -> dict[str, Any]:
     return {
         "scheme": "clouddrive2-file",
@@ -533,95 +547,123 @@ def _observation(
         "is_cloud_file": bool(info and info.get("is_cloud_file")),
         "is_local": bool(info and info.get("is_local")),
         "listing": listing,
+        "listing_rpc": listing_rpc,
+        "listing_attempts": listing_attempts,
+        "listing_error": listing_error,
         "upload_list": upload_list,
+        "upload_rpc": upload_rpc,
+        "upload_attempts": upload_attempts,
+        "upload_error": upload_error,
     }
 
 
-async def _retry(call, method: str, payload: bytes, *, attempts: int, base: float, sleep, rng) -> bytes:
-    error: Exception | None = None
+class _Call:
+    def __init__(self) -> None:
+        self.value: bytes | None = None
+        self.attempts = 0
+        self.error = ""
+
+
+async def _retry(call, method: str, payload: bytes, *, attempts: int, base: float, sleep, rng) -> _Call:
+    result = _Call()
     for attempt in range(attempts):
+        result.attempts = attempt + 1
         try:
-            return await call(method, payload)
+            result.value = await call(method, payload)
+            result.error = ""
+            return result
         except Exception as exc:  # noqa: BLE001 - one attempt is not the final result
-            error = exc
+            result.error = "timeout" if isinstance(exc, TimeoutError) else "rpc"
             if attempt + 1 >= attempts:
-                break
+                return result
             delay = min(base * (2 ** attempt), 8.0) * (0.5 + float(rng()))
             await sleep(delay)
-    raise error if error is not None else TimeoutError("cd2")
+    return result
 
 
 async def _lookup(call, parent: str, name: str, *, attempts: int, base: float, sleep, rng):
-    """Return ``(info, listing)``. A finished directory list is the only ``missing`` signal."""
-    try:
-        found = file_from_unary(await _retry(
-            call, "FindFileByPath", encode_find(parent, name),
-            attempts=attempts, base=base, sleep=sleep, rng=rng,
-        ))
-        if _cloud_proof(found, name):
-            return found, "ok"
-    except Exception:  # noqa: BLE001 - fall through to the name search
-        found = None
-    try:
-        matches = [
-            item for item in files_from_subfiles(await _retry(
-                call, "GetSearchResults", encode_search(parent, name),
-                attempts=attempts, base=base, sleep=sleep, rng=rng,
-            ))
-            if _named(item, name)
-        ]
+    """Return file, listing, rpc name, attempts, and error class.
+
+    A finished directory list is the only ``missing`` signal.
+    """
+    found = await _retry(
+        call, "FindFileByPath", encode_find(parent, name),
+        attempts=attempts, base=base, sleep=sleep, rng=rng,
+    )
+    if not found.error:
+        info = file_from_unary(found.value or b"")
+        if _cloud_proof(info, name):
+            return info, "ok", "FindFileByPath", found.attempts, ""
+    searched = await _retry(
+        call, "GetSearchResults", encode_search(parent, name),
+        attempts=attempts, base=base, sleep=sleep, rng=rng,
+    )
+    if not searched.error:
+        matches = [item for item in files_from_subfiles(searched.value or b"") if _named(item, name)]
         if len(matches) > 1:
-            return None, "ambiguous"
+            return None, "ambiguous", "GetSearchResults", searched.attempts, ""
         if len(matches) == 1 and _cloud_proof(matches[0], name):
-            return matches[0], "ok"
-    except Exception:  # noqa: BLE001 - fall through to the directory list
-        matches = None
-    try:
-        listed = [
-            item for item in files_from_subfiles(await _retry(
-                call, "GetSubFiles", encode_subfiles(parent),
-                attempts=attempts, base=base, sleep=sleep, rng=rng,
-            ))
-            if _named(item, name)
-        ]
-    except Exception:  # noqa: BLE001 - transport failure is not "file missing"
-        return None, "timeout"
-    if len(listed) > 1:
-        return None, "ambiguous"
-    if len(listed) == 1:
-        return listed[0], "ok"
-    return None, "missing"
+            return matches[0], "ok", "GetSearchResults", searched.attempts, ""
+    listed = await _retry(
+        call, "GetSubFiles", encode_subfiles(parent),
+        attempts=attempts, base=base, sleep=sleep, rng=rng,
+    )
+    if listed.error:
+        return None, "timeout", "GetSubFiles", listed.attempts, listed.error
+    matches = [item for item in files_from_subfiles(listed.value or b"") if _named(item, name)]
+    if len(matches) > 1:
+        return None, "ambiguous", "GetSubFiles", listed.attempts, ""
+    if len(matches) == 1:
+        return matches[0], "ok", "GetSubFiles", listed.attempts, ""
+    return None, "missing", "GetSubFiles", listed.attempts, "empty"
 
 
-async def _upload_state(call, name: str, full: str, *, attempts: int, base: float, sleep, rng) -> str:
-    found: list[dict[str, Any]] = []
-    seen = 0
-    covered = False
-    try:
-        for page in range(1, _MAX_PAGES + 1):
-            blob = await _retry(
-                call, "GetUploadFileList", encode_upload_page(name, page),
-                attempts=attempts, base=base, sleep=sleep, rng=rng,
-            )
-            items, total, filtered = parse_upload_page(blob)
-            found.extend(items)
-            seen += len(items)
-            limit = filtered if filtered is not None else total
-            if len(items) < _PAGE_SIZE or (limit is not None and seen >= limit):
-                covered = True
-                break
-    except Exception:  # noqa: BLE001 - retries are inside _retry; this is the exhausted result
-        return "inconclusive"
-    busy = any(
+def _busy(items: list[dict[str, Any]], name: str, full: str) -> bool:
+    return any(
         item["dest"].rstrip("/").endswith("/" + name) or item["dest"].rstrip("/") == full.rstrip("/")
-        for item in found
+        for item in items
         if item["status"] in _IN_PROGRESS
     )
-    if busy:
-        return "busy"
-    if not covered:
-        return "inconclusive"
-    return "clear"
+
+
+async def _upload_state(call, name: str, full: str, *, attempts: int, base: float, sleep, rng) -> dict[str, Any]:
+    """Active queue only. A name-filtered page is not requested."""
+    count = await _retry(
+        call, "GetUploadFileCount", b"",
+        attempts=attempts, base=base, sleep=sleep, rng=rng,
+    )
+    if count.error:
+        return {
+            "state": "unsupported",
+            "upload_rpc": "GetUploadFileCount",
+            "upload_attempts": count.attempts,
+            "upload_error": count.error,
+        }
+    if parse_upload_count(count.value or b"") == 0:
+        return {
+            "state": "clear",
+            "upload_rpc": "GetUploadFileCount",
+            "upload_attempts": count.attempts,
+            "upload_error": "empty",
+        }
+    listed = await _retry(
+        call, "GetUploadFileList", encode_upload_all(),
+        attempts=attempts, base=base, sleep=sleep, rng=rng,
+    )
+    if listed.error:
+        return {
+            "state": "inconclusive",
+            "upload_rpc": "GetUploadFileList",
+            "upload_attempts": listed.attempts,
+            "upload_error": listed.error,
+        }
+    items = uploads_from_list(listed.value or b"")
+    return {
+        "state": "busy" if _busy(items, name, full) else "clear",
+        "upload_rpc": "GetUploadFileList",
+        "upload_attempts": listed.attempts,
+        "upload_error": "empty" if not items else "",
+    }
 
 
 async def read_back(
@@ -663,15 +705,21 @@ async def read_back(
     pause = asyncio.sleep if sleep is None else sleep
     roll = random.random if rng is None else rng
     attempts, base = retry_attempts(), retry_base()
-    info, listing = await _lookup(
+    info, listing, listing_rpc, listing_attempts, listing_error = await _lookup(
         rpc, api_parent, name, attempts=attempts, base=base, sleep=pause, rng=roll,
     )
     if listing != "ok" or not _cloud_proof(info, name):
-        return _observation(relative_path, info if listing == "ok" else None, listing=listing, upload_list="not_asked", proven=False)
+        return _observation(
+            relative_path, info if listing == "ok" else None, listing=listing, upload_list="not_asked",
+            proven=False, listing_rpc=listing_rpc, listing_attempts=listing_attempts, listing_error=listing_error,
+        )
     full = (info or {}).get("full_path") or _join(api_parent, name)
-    upload_list = await _upload_state(
+    upload = await _upload_state(
         rpc, name, str(full), attempts=attempts, base=base, sleep=pause, rng=roll,
     )
     return _observation(
-        relative_path, info, listing="ok", upload_list=upload_list, proven=upload_list == "clear",
+        relative_path, info, listing="ok", upload_list=upload["state"], proven=upload["state"] == "clear",
+        listing_rpc=listing_rpc, listing_attempts=listing_attempts, listing_error=listing_error,
+        upload_rpc=upload["upload_rpc"], upload_attempts=upload["upload_attempts"],
+        upload_error=upload["upload_error"],
     )

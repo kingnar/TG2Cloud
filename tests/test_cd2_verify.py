@@ -14,7 +14,7 @@ from tg2cloud.channel_bulk.cd2api import (
     _request_headers,
     _varint,
     encode_subfiles,
-    encode_upload_page,
+    encode_upload_all,
     files_from_subfiles,
     grpc_unary,
     read_back,
@@ -95,11 +95,13 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_file_id_accepts_and_size_or_inflight_does_not(self):
         good = _file_blob("file-1", "clip.mp4", 10)
-        uploads = _grpc(b"")
 
         async def rpc(method, payload):
+            del payload
+            if method == "GetUploadFileCount":
+                return _grpc(b"")
             if method == "GetUploadFileList":
-                return uploads
+                raise AssertionError("idle queue must not list tasks")
             return good
 
         observed = await read_back("library/clip.mp4", expected_size=10, rpc=rpc)
@@ -113,7 +115,12 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
         busy = _grpc(_field(2, 2, _field(2, 2, b"/library/clip.mp4") + _field(8, 0, _varint(3))))
 
         async def busy_rpc(method, payload):
-            return busy if method == "GetUploadFileList" else good
+            if method == "GetUploadFileCount":
+                return _grpc(_field(1, 0, _varint(1)))
+            if method == "GetUploadFileList":
+                self.assertEqual(payload, encode_upload_all())
+                return busy
+            return good
 
         held = await read_back("library/clip.mp4", expected_size=10, rpc=busy_rpc)
         self.assertNotEqual(assess(
@@ -240,16 +247,20 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
             calls.append(method)
             if method == "FindFileByPath":
                 return _raw_file("file-1", "clip.mp4", 10)
-            if method == "GetUploadFileList":
-                self.assertEqual(payload, encode_upload_page("clip.mp4", 1))
-                self.assertNotIn(b"\x08\x01", payload)
+            if method == "GetUploadFileCount":
+                self.assertEqual(payload, b"")
                 return _grpc(b"")
             raise AssertionError(method)
 
         observed = await read_back(
             "library/clip.mp4", expected_size=10, rpc=direct, sleep=_no_sleep, rng=lambda: 0,
         )
-        self.assertEqual(calls, ["FindFileByPath", "GetUploadFileList"])
+        self.assertEqual(calls, ["FindFileByPath", "GetUploadFileCount"])
+        self.assertEqual(observed["upload_list"], "clear")
+        self.assertEqual(observed["upload_rpc"], "GetUploadFileCount")
+        self.assertEqual(observed["upload_error"], "empty")
+        self.assertEqual(observed["listing_rpc"], "FindFileByPath")
+        self.assertEqual(observed["listing_attempts"], 1)
         self.assertEqual(assess(
             observed, expected_size=10, expected_dest="library/clip.mp4", expected_fingerprint=None,
         ), "accept")
@@ -264,7 +275,10 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
             "library/clip.mp4", expected_size=10, rpc=upload_down, sleep=_no_sleep, rng=lambda: 0,
         )
         self.assertEqual(held["listing"], "ok")
-        self.assertEqual(held["upload_list"], "inconclusive")
+        self.assertEqual(held["upload_list"], "unsupported")
+        self.assertEqual(held["upload_rpc"], "GetUploadFileCount")
+        self.assertEqual(held["upload_error"], "timeout")
+        self.assertEqual(held["upload_attempts"], 3)
         self.assertEqual(held["destination_id"], "file-1")
         self.assertFalse(held["read_back"])
         self.assertEqual(assess(
@@ -319,6 +333,21 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(idle_timeout(), 90.0)
         with patch.dict(os.environ, {"TG2CLOUD_CD2_API_TIMEOUT_SECONDS": "999"}):
             self.assertEqual(idle_timeout(), 60.0)
+        from tg2cloud.channel_bulk.remote_evidence import verification_report
+
+        quiet = dict(held)
+        report = verification_report(quiet, size=10, dest="library/clip.mp4", attest=True)
+        self.assertFalse(report["accepted"])
+        self.assertFalse(report["attested"])
+        with patch.dict(os.environ, {"TG2CLOUD_CD2_UPLOAD_ATTEST": "1"}):
+            allowed = verification_report(quiet, size=10, dest="library/clip.mp4", attest=True)
+        self.assertTrue(allowed["accepted"])
+        self.assertTrue(allowed["attested"])
+        self.assertEqual(allowed["upload_list"], "unsupported")
+        self.assertEqual(allowed["upload_error"], "timeout")
+        self.assertEqual(assess(
+            quiet, expected_size=10, expected_dest="library/clip.mp4", expected_fingerprint=None,
+        ), "reject")
 
 
 def safe(path: str) -> bool:
