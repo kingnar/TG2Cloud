@@ -14,6 +14,7 @@ from tg2cloud.channel_bulk.ledger import (
     cooldown_seconds,
     disk_allows,
 )
+from tg2cloud.channel_bulk.remote_evidence import assess
 from tg2cloud.domain.errors import RemoteReviewRequired, failure_kind, safe_failure
 from tg2cloud.domain.naming import safe_file_name
 from tg2cloud.persistence.quotas import QuotaExceeded
@@ -302,12 +303,17 @@ async def _upload(ctx, job, task, media, local: Path, item: dict) -> str:
         ctx.db.transition(int(task["id"]), "uploading", remote_temp_path=remote, error=None)
     await ctx.transport.upload(item=media, path=local, remote=remote, rate=rate, size=int(media["size"]))
     ctx.db.transition(int(task["id"]), "verifying")
-    probe = await ctx.transport.probe(item=media, remote=remote, size=int(media["size"]))
-    proven = (
-        isinstance(probe, dict)
-        and probe.get("cache_only") is False
-        and int(probe.get("size", -1)) == int(media["size"])
+    current = ctx.db.get(int(task["id"])) or task
+    fingerprint = current.get("content_fingerprint")
+    probe = await ctx.transport.probe(
+        item=media, remote=remote, size=int(media["size"]), fingerprint=fingerprint,
     )
+    proven = assess(
+        probe,
+        expected_size=int(media["size"]),
+        expected_dest=remote,
+        expected_fingerprint=fingerprint,
+    ) == "accept"
     if not proven:
         ctx.db.transition(
             int(task["id"]),

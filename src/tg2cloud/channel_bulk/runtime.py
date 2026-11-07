@@ -92,6 +92,6 @@ class ListenerTransport:
         del item, size
         await upload_bounded(self.owner.rclone, path, remote, rate)
 
-    async def probe(self, *, item, remote, size):
-        del item, size
+    async def probe(self, *, item, remote, size, fingerprint=None):
+        del item, size, fingerprint
         return await probe_remote(self.owner.rclone, remote)

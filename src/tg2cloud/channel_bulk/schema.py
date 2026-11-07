@@ -113,6 +113,15 @@ def ensure(connection: sqlite3.Connection) -> None:
                 PRIMARY KEY (period_kind, period_key)
             )"""
         )
+        _add_column(connection, "channel_inventory", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS channel_local_requests (
+                request_id TEXT PRIMARY KEY,
+                command TEXT NOT NULL,
+                result TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )"""
+        )
         connection.execute(
             """CREATE TABLE IF NOT EXISTS channel_quota_attestation (
                 id INTEGER PRIMARY KEY CHECK (id = 1),

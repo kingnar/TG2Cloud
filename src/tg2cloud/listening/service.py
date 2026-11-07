@@ -704,6 +704,13 @@ class Listener:
             hold_on_startup(self.db)
         except Exception:  # noqa: BLE001 - a bookkeeping failure must not disable listening
             self.owner.log.warning("频道批量作业未自动挂起；批量任务仍不会被调度器领取")
+        control = None
+        try:
+            from tg2cloud.channel_bulk.local_control import start_local_control
+
+            control = await start_local_control(self.owner)
+        except Exception:  # noqa: BLE001 - local control must not stop listening or start a scan
+            self.owner.log.warning("本地控制套接字未开启；不会自动盘点")
         try:
             while not self.owner._stop.is_set():
                 self._maintain_if_due()
@@ -750,4 +757,6 @@ class Listener:
                             )
                 await asyncio.sleep(5)
         finally:
+            if control is not None:
+                await control.close()
             await self.close()

@@ -135,6 +135,7 @@ class TaskViews:
             text += (
                 "\n频道盘点：/inventory start <聊天ID>（只读元数据，不下载、不自动转存）\n"
                 "批量转存：/bulk（默认预览；显式 resume 前不会开始）\n"
+                "本地控制：数据目录套接字，不自动盘点、不发消息\n"
             )
         return text
 

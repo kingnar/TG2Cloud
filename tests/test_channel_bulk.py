@@ -69,9 +69,10 @@ class Clock:
 
 
 class Transport:
-    def __init__(self, *, cache_only=False, fail=None):
+    def __init__(self, *, cache_only=False, fail=None, evidence=False):
         self.cache_only = cache_only
         self.fail = fail
+        self.evidence = evidence
         self.downloads = 0
         self.uploads = 0
 
@@ -88,8 +89,21 @@ class Transport:
         if self.fail == "upload":
             raise self.fail_exc
 
-    async def probe(self, *, item, remote, size):
-        return {"size": size, "cache_only": self.cache_only}
+    async def probe(self, *, item, remote, size, fingerprint=None):
+        del item
+        if not self.evidence:
+            return {"size": size, "cache_only": self.cache_only, "scheme": "webdav", "method": "size"}
+        return {
+            "scheme": "clouddrive2-upload-task",
+            "status": "Finish",
+            "size": size,
+            "transferred_bytes": size,
+            "dest_path": remote,
+            "source_fingerprint": fingerprint,
+            "destination_id": "cloud-file",
+            "read_back": True,
+            "cache_only": False,
+        }
 
 
 class Ctx:
@@ -287,17 +301,26 @@ class ChannelBulkTests(unittest.TestCase):
         # The held item is not pending, so a new file is required for the accept path.
         self.assertEqual(jobs.get_job(self.db, job["id"])["state"], "paused")
 
-    def test_remote_review_false_completes_and_true_does_not(self):
+    def test_webdav_size_is_not_completion_and_read_back_is(self):
         job = self._job_with([video(71, duration=90, size=32)])
         self._arm(job["id"])
         ctx = Ctx(self.db, job["id"], "library/videos", self.clock, Transport(cache_only=False), self.root, 42)
-        self.assertEqual(asyncio.run(run_job(ctx)), "idle")
+        self.assertEqual(asyncio.run(run_job(ctx)), "remote_review")
         task = self.db._conn.execute("SELECT * FROM tasks").fetchone()
-        self.assertEqual(task["state"], "completed")
-        self.assertIsNone(task["local_path"])
-        self.assertEqual(task["verification_method"], "remote_review")
-        source = self.db._conn.execute("SELECT enabled FROM listener_sources").fetchone()
-        self.assertEqual(source["enabled"], 0)
+        self.assertNotEqual(task["state"], "completed")
+        self.assertTrue(Path(task["local_path"]).is_file())
+        self.assertIsNone(task["verification_method"])
+        proven = self._job_with([video(72, duration=90, size=32)])
+        self._arm(proven["id"])
+        ctx = Ctx(
+            self.db, proven["id"], "library/videos", self.clock,
+            Transport(evidence=True), self.root, 42,
+        )
+        self.assertEqual(asyncio.run(run_job(ctx)), "idle")
+        done = self.db._conn.execute("SELECT * FROM tasks WHERE message_id=72").fetchone()
+        self.assertEqual(done["state"], "completed")
+        self.assertIsNone(done["local_path"])
+        self.assertEqual(done["verification_method"], "remote_review")
 
     def test_budget_retry_rate_cooldown_disk_and_active_dedup(self):
         self.assertTrue(charge(self.db, 600, now=self.clock.now(), daily_cap=1000, monthly_cap=1000))
@@ -338,7 +361,7 @@ class ChannelBulkTests(unittest.TestCase):
             self.db, flood["id"], built["hash"], now=self.clock.now(), disk_free=10**12, min_free=0,
             directories={"media": "library/videos"},
         )
-        failing = Transport(cache_only=False, fail="download")
+        failing = Transport(cache_only=False, fail="download", evidence=True)
         failing.fail_exc = RuntimeError("HTTP 429 retry-after: 12")
         ctx = Ctx(self.db, flood["id"], "library/videos", self.clock, failing, self.root, 42)
         self.assertEqual(asyncio.run(run_job(ctx)), "cooldown")

@@ -207,6 +207,47 @@ async def step(db, inventory_id: int, fetch, *, pages: int = 1, now, sleep) -> s
     return outcome
 
 
+def request_cancel(db, inventory_id: int, *, now: float) -> None:
+    ensure_db(db)
+    with db._lock:
+        db._conn.execute(
+            """UPDATE channel_inventory SET cancel_requested=1, status='paused',
+               error='cancelled', updated_at=? WHERE id=?""",
+            (now, int(inventory_id)),
+        )
+
+
+async def run_bounded(db, inventory_id: int, fetch, *, max_pages: int, max_seconds: float, now, sleep) -> str:
+    """Page until complete, cooldown, cancel, or the caller bound. Does not open a client."""
+    if not 1 <= int(max_pages) <= 200 or not 1 <= float(max_seconds) <= 600:
+        raise ValueError("盘点运行界限无效")
+    ensure_db(db)
+    with db._lock:
+        db._conn.execute(
+            "UPDATE channel_inventory SET cancel_requested=0, updated_at=? WHERE id=?",
+            (float(now()), int(inventory_id)),
+        )
+    started = float(now())
+    pages = 0
+    outcome = "bounded"
+    while pages < int(max_pages) and float(now()) - started < float(max_seconds):
+        current = _row(db, inventory_id)
+        if int(current["cancel_requested"]):
+            _mark(db, inventory_id, status="paused", error="cancelled", now=float(now()))
+            return "cancelled"
+        if float(current["cooldown_until"]) > float(now()):
+            return "cooldown"
+        outcome = await step(db, inventory_id, fetch, pages=1, now=now, sleep=sleep)
+        pages += 1
+        if outcome in {"complete", "flood", "stalled", "cooldown"}:
+            return outcome
+        if pages < int(max_pages) and float(now()) - started < float(max_seconds):
+            delay = float(_row(db, inventory_id)["delay_seconds"])
+            await sleep(delay)
+    _mark(db, inventory_id, status="paused", error="bounded", now=float(now()))
+    return "bounded"
+
+
 _UNSET = object()
 
 
