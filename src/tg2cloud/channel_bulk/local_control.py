@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 from tg2cloud.channel_bulk import inventory, jobs
+from tg2cloud.channel_bulk.ledger import Refusal, attest
 from tg2cloud.channel_bulk.schema import ensure_db
 
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -34,6 +35,16 @@ _COMMANDS = {
     "inventory.review",
     "bulk.preview",
     "bulk.status",
+    "bulk.gates",
+    "bulk.limits",
+    "bulk.whitelist",
+    "bulk.allow",
+    "bulk.ack-egress",
+    "bulk.attest",
+    "bulk.manifest",
+    "bulk.resume",
+    "bulk.pause",
+    "bulk.cancel",
     "remote.verify",
     "ping",
 }
@@ -283,6 +294,13 @@ class LocalControl:
                 result = {"ok": False, "error": "bad-request"}
             except KeyError:
                 result = {"ok": False, "error": "missing"}
+            except Refusal as exc:
+                result = {
+                    "ok": False,
+                    "error": "blocked",
+                    "code": exc.code,
+                    "detail": str(exc)[:200],
+                }
             if result.get("ok"):
                 _store(self.owner.db, request_id, command, result)
             waiter.set_result(result)
@@ -340,12 +358,16 @@ class LocalControl:
             inventory_id = _number(request.get("inventory_id"), "inventory")
             alias = request.get("alias")
             job = jobs.open_job(self.owner.db, inventory_id, str(alias), now=time.time())
-            if job["state"] != "preview":
-                return {"ok": False, "error": "state", "job_id": job["id"]}
-            return {"ok": True, "job_id": job["id"], "status": job["state"]}
-        if command == "bulk.status":
-            job = jobs.get_job(self.owner.db, _number(request.get("job_id"), "job"))
-            return {"ok": True, "job_id": job["id"], "status": job["state"]}
+            return {
+                "ok": True,
+                "job_id": job["id"],
+                "status": job["state"],
+                "reused": bool(job.get("reused")),
+            }
+        if command == "bulk.status" or command == "bulk.gates":
+            return self._bulk_view(request)
+        if command.startswith("bulk."):
+            return await self._bulk(command, request)
         if command == "remote.verify":
             return await self._verify(request)
         return {"ok": False, "error": "bad-request"}
@@ -428,6 +450,111 @@ class LocalControl:
                 self._scanning = False
         return {key: value for key, value in result.items() if key != "caption"}
 
+    def _bulk_view(self, request: dict) -> dict:
+        job = jobs.get_job(self.owner.db, _number(request.get("job_id"), "job"))
+        digest = request.get("manifest_hash")
+        if digest is None:
+            digest = job["manifest_hash"]
+        if not isinstance(digest, str):
+            return {"ok": False, "error": "bad-request", "job_id": job["id"]}
+        blocked = jobs.blockers(
+            self.owner.db, job["id"], digest, now=time.time(), directories=_directories(self.owner),
+        )
+        return {
+            "ok": True,
+            "job_id": job["id"],
+            "status": job["state"],
+            "has_manifest": bool(job["manifest_hash"]),
+            "blockers": blocked,
+        }
+
+    async def _bulk(self, command: str, request: dict) -> dict:
+        job_id = _number(request.get("job_id"), "job")
+        now = time.time()
+        if command == "bulk.limits":
+            daily = _positive(request.get("daily_bytes"), "daily_bytes")
+            monthly = _positive(request.get("monthly_bytes"), "monthly_bytes")
+            down = _positive(request.get("down_bps"), "down_bps")
+            up = _positive(request.get("up_bps"), "up_bps")
+            if daily > monthly:
+                raise Refusal("budget", "每日额度不能大于每月额度")
+            job = jobs.update_controls(
+                self.owner.db, job_id, now=now,
+                daily_bytes=daily, monthly_bytes=monthly, down_bps=down, up_bps=up,
+            )
+            return {"ok": True, "job_id": job["id"], "status": job["state"]}
+        if command == "bulk.whitelist":
+            aliases = request.get("aliases")
+            if not isinstance(aliases, list) or not all(isinstance(item, str) for item in aliases):
+                raise ValueError("bad-request")
+            job = jobs.set_whitelist(self.owner.db, job_id, aliases, now=now)
+            return {"ok": True, "job_id": job["id"], "whitelist_count": len(job["whitelist"])}
+        if command == "bulk.allow":
+            allow = request.get("message_ids")
+            if (
+                not isinstance(allow, list)
+                or len(allow) > 500
+                or any(type(item) is not int or isinstance(item, bool) or item <= 0 for item in allow)
+            ):
+                raise ValueError("bad-request")
+            job = jobs.update_controls(self.owner.db, job_id, now=now, allow=allow)
+            return {"ok": True, "job_id": job["id"], "allow_count": len(job["controls"]["allow"])}
+        if command == "bulk.ack-egress":
+            if request.get("ack") is not True:
+                return {
+                    "ok": False, "error": "blocked", "job_id": job_id, "code": "egress",
+                    "blockers": [{
+                        "code": "egress", "fields": ["ack"],
+                        "detail": "需要明确确认网关延迟出站流量也计入本地额度",
+                    }],
+                }
+            job = jobs.update_controls(self.owner.db, job_id, now=now, egress_ack=True)
+            return {"ok": True, "job_id": job["id"], "status": job["state"]}
+        if command == "bulk.attest":
+            remaining = request.get("remaining_bytes")
+            period_end = request.get("period_end")
+            if type(remaining) is not int or isinstance(remaining, bool) or remaining < 0:
+                raise Refusal("attestation", "remaining_bytes 必须由操作者按实际账单填写，不能缺省")
+            if isinstance(period_end, bool) or not isinstance(period_end, (int, float)):
+                raise Refusal("attestation", "period_end 必须是周期结束的 Unix 时间")
+            attest(
+                self.owner.db, remaining_bytes=remaining, period_end=float(period_end),
+                now=now, note="",
+            )
+            return {"ok": True, "job_id": job_id, "attested": True}
+        if command == "bulk.manifest":
+            through = request.get("through_message_id")
+            if type(through) is not int or isinstance(through, bool) or through <= 0:
+                raise Refusal("manifest", "through_message_id 必须是已审核到的最大消息编号")
+            if "expand" in request and type(request.get("expand")) is not bool:
+                raise ValueError("bad-request")
+            built = jobs.manifest(
+                self.owner.db, job_id, now=now, through=through, expand=request.get("expand") is True,
+            )
+            return {
+                "ok": True,
+                "job_id": job_id,
+                "hash": built["hash"],
+                "count": built["count"],
+                "through": through,
+                "held_back": built["held_back"],
+            }
+        if command == "bulk.resume":
+            digest = request.get("manifest_hash")
+            if not isinstance(digest, str):
+                digest = ""
+            from tg2cloud.channel_bulk.control import start_resume
+
+            result = await start_resume(self.owner, job_id, digest)
+            return result
+        if command == "bulk.pause":
+            job = jobs.pause(self.owner.db, job_id, now=now, error="管理员暂停")
+            return {"ok": True, "job_id": job["id"], "status": job["state"]}
+        if command == "bulk.cancel":
+            job = jobs.cancel(self.owner.db, job_id, now=now)
+            return {"ok": True, "job_id": job["id"], "status": job["state"]}
+        return {"ok": False, "error": "bad-request"}
+
     async def _verify(self, request: dict) -> dict:
         from tg2cloud.channel_bulk.cd2api import read_back, safe_relative
         from tg2cloud.channel_bulk.remote_evidence import verification_report
@@ -455,6 +582,25 @@ class LocalControl:
             "matched": sum(1 for item in items if item["accepted"]),
             "items": items,
         }
+
+
+def _directories(owner) -> dict[str, str]:
+    try:
+        from tg2cloud.persistence.plans import Plans
+
+        admin = owner.settings.allowed_user_id
+        found = Plans(owner.db, admin).directories(admin)
+    except Exception:  # noqa: BLE001 - a missing directory table is an unauthorized alias, not a crash
+        return {}
+    if not isinstance(found, dict):
+        return {}
+    return {str(key): str(value) for key, value in found.items()}
+
+
+def _positive(value, name: str) -> int:
+    if type(value) is not int or isinstance(value, bool) or not 1 <= value <= 2**62:
+        raise Refusal("config", f"{name} 必须是正整数；0 不是无限，也不能关闭保护")
+    return value
 
 
 def _number(value, name: str) -> int:

@@ -54,7 +54,16 @@ def selected(item: dict[str, Any], *, excluded: set[int], dedup: str, controls: 
     return float(item["duration"]) > int(controls.get("min_duration", DEFAULT_MIN_DURATION))
 
 
-def canonical_manifest(job_id: int, chat_id: int, alias: str, whitelist: list[str], controls: dict, ids: list[int]) -> str:
+def canonical_manifest(
+    job_id: int,
+    chat_id: int,
+    alias: str,
+    whitelist: list[str],
+    controls: dict,
+    ids: list[int],
+    *,
+    through: int | None = None,
+) -> str:
     import hashlib
 
     payload = {
@@ -66,5 +75,7 @@ def canonical_manifest(job_id: int, chat_id: int, alias: str, whitelist: list[st
         "min_duration": int(controls.get("min_duration", DEFAULT_MIN_DURATION)),
         "whitelist": list(whitelist),
     }
+    if through is not None:
+        payload["through"] = int(through)
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(raw).hexdigest()

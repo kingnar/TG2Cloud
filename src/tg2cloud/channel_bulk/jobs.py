@@ -68,6 +68,17 @@ def open_job(db, inventory_id: int, alias: str, *, now: float) -> dict:
         "egress_ack": False,
     }
     with db._lock:
+        existing = db._conn.execute(
+            """SELECT id FROM channel_bulk_jobs
+               WHERE inventory_id=? AND directory_alias=? AND state!='cancelled'
+               ORDER BY id LIMIT 1""",
+            (int(inventory_id), alias),
+        ).fetchone()
+    if existing is not None:
+        job = get_job(db, int(existing[0]))
+        job["reused"] = True
+        return job
+    with db._lock:
         cursor = db._conn.execute(
             """INSERT INTO channel_bulk_jobs(
                 chat_id, inventory_id, state, directory_alias, manifest_hash, controls,
@@ -84,7 +95,9 @@ def open_job(db, inventory_id: int, alias: str, *, now: float) -> dict:
             ),
         )
         job_id = int(cursor.lastrowid)
-    return get_job(db, job_id)
+    job = get_job(db, job_id)
+    job["reused"] = False
+    return job
 
 
 def update_controls(db, job_id: int, *, now: float, **changes) -> dict:
@@ -143,19 +156,44 @@ def set_whitelist(db, job_id: int, aliases: list[str], *, now: float) -> dict:
     return get_job(db, job_id)
 
 
-def manifest(db, job_id: int, *, now: float) -> dict:
-    """Rebuild the reviewed id list and its hash. Does not start transfers."""
+def manifest(db, job_id: int, *, now: float, through: int | None = None, expand: bool = False) -> dict:
+    """Rebuild the reviewed id list and its hash. Does not start transfers.
+
+    ``through`` is the highest message id the operator has reviewed. Newer ids
+    stay out. Once a hash exists, later rebuilds keep that set unless ``expand``
+    is explicit, and even then they cannot pass ``through``.
+    """
     job = get_job(db, job_id)
     if job["state"] not in OPEN_STATES:
         raise Refusal("state", "运行中的作业不能改清单")
+    if through is not None and (type(through) is not int or isinstance(through, bool) or through <= 0):
+        raise Refusal("manifest", "审核上界必须是正整数消息编号")
     rows = items(db, job["inventory_id"])
     excluded = exclusions(db, job["chat_id"])
+    with db._lock:
+        previous = {
+            int(row[0])
+            for row in db._conn.execute(
+                "SELECT message_id FROM channel_bulk_items WHERE job_id=?", (int(job_id),)
+            )
+        }
+    frozen = bool(job["manifest_hash"]) and not expand
     chosen = []
+    held_back = 0
     for row in sorted(rows, key=lambda item: int(item["message_id"])):
-        if selected(row, excluded=excluded, dedup=row["dedup"], controls=job["controls"]):
-            chosen.append(int(row["message_id"]))
+        message_id = int(row["message_id"])
+        if not selected(row, excluded=excluded, dedup=row["dedup"], controls=job["controls"]):
+            continue
+        if through is not None and message_id > int(through):
+            held_back += 1
+            continue
+        if frozen and message_id not in previous:
+            held_back += 1
+            continue
+        chosen.append(message_id)
     digest = canonical_manifest(
-        job_id, job["chat_id"], job["directory_alias"], job["whitelist"], job["controls"], chosen
+        job_id, job["chat_id"], job["directory_alias"], job["whitelist"], job["controls"], chosen,
+        through=through,
     )
     with db._lock:
         db._conn.execute("BEGIN IMMEDIATE")
@@ -177,7 +215,69 @@ def manifest(db, job_id: int, *, now: float) -> dict:
         except BaseException:
             db._conn.execute("ROLLBACK")
             raise
-    return {"hash": digest, "count": len(chosen), "ids": chosen}
+    return {"hash": digest, "count": len(chosen), "ids": chosen, "through": through, "held_back": held_back}
+
+
+def blockers(db, job_id: int, manifest_hash: str, *, now: float, directories: dict[str, str]) -> list[dict]:
+    """Every closed gate, with the fields the operator must supply. No state change."""
+    try:
+        job = get_job(db, job_id)
+    except KeyError:
+        return [{"code": "missing", "fields": ["job_id"], "detail": "批量作业不存在"}]
+    if job["state"] == "running" and isinstance(manifest_hash, str) and job["manifest_hash"] == manifest_hash.lower():
+        return []
+    found = []
+    if job["state"] not in OPEN_STATES:
+        return [{"code": "state", "fields": ["job_id"], "detail": f"状态 {job['state']} 不能恢复"}]
+    if (
+        not isinstance(manifest_hash, str)
+        or len(manifest_hash) != 64
+        or job["manifest_hash"] != manifest_hash.lower()
+    ):
+        found.append({
+            "code": "manifest",
+            "fields": ["manifest_hash", "through_message_id"],
+            "detail": "需要与当前已固定清单一致的 64 位哈希；没有清单时先生成",
+        })
+    if float(job["cooldown_until"]) > now:
+        found.append({"code": "cooldown", "fields": [], "detail": "限流冷却未结束"})
+    if job["directory_alias"] not in job["whitelist"] or job["directory_alias"] not in directories:
+        found.append({
+            "code": "directory",
+            "fields": ["alias"],
+            "detail": "目标别名不在白名单或未授权目录中",
+        })
+    controls = job["controls"]
+    if controls.get("egress_ack") is not True:
+        found.append({
+            "code": "egress",
+            "fields": ["ack"],
+            "detail": "尚未确认网关延迟出站流量也计入本地额度",
+        })
+    missing_budget = [
+        name for name in ("daily_bytes", "monthly_bytes") if int(controls.get(name) or 0) <= 0
+    ]
+    if missing_budget:
+        found.append({
+            "code": "budget",
+            "fields": missing_budget,
+            "detail": "每日和每月字节上限必须是正整数；0 不是无限，程序也不会填供应商额度",
+        })
+    missing_rate = [name for name in ("down_bps", "up_bps") if int(controls.get(name) or 0) <= 0]
+    if missing_rate:
+        found.append({
+            "code": "rate",
+            "fields": missing_rate,
+            "detail": "下载和上传字节速率必须是正整数；0 不会关闭限速",
+        })
+    record = attestation(db)
+    if record is None or float(record["period_end"]) <= now:
+        found.append({
+            "code": "attestation",
+            "fields": ["remaining_bytes", "period_end"],
+            "detail": "没有未过期的实际剩余额度确认；程序不会默认剩余流量",
+        })
+    return found
 
 
 def rejection(db, job_id: int, manifest_hash: str, *, now: float, directories: dict[str, str]) -> str | None:

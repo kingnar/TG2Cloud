@@ -12,7 +12,6 @@ from tg2cloud.channel_bulk.schema import ensure_db
 from tg2cloud.channel_bulk.transfer import listener_busy, run_job
 
 _ALIAS = re.compile(r"^.{1,32}$")
-_HASH = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _int(value: str, name: str) -> int:
@@ -85,7 +84,11 @@ def _account(owner) -> int:
 def _directories(owner) -> dict[str, str]:
     from tg2cloud.persistence.plans import Plans
 
-    return Plans(owner.db, owner.settings.allowed_user_id).directories(owner.settings.allowed_user_id)
+    try:
+        found = Plans(owner.db, owner.settings.allowed_user_id).directories(owner.settings.allowed_user_id)
+    except Exception:  # noqa: BLE001 - missing directory storage is an unauthorized alias
+        return {}
+    return found if isinstance(found, dict) else {}
 
 
 async def handle(owner, parts: list[str]) -> str:
@@ -218,28 +221,48 @@ async def _bulk(owner, args: list[str]) -> str:
             f"确认剩余：{remaining}\n备注：{job.get('error') or '无'}"
         )
     if action == "resume" and len(args) == 3:
-        if _HASH.fullmatch(args[2]) is None:
-            raise Refusal("manifest", "清单哈希必须是 64 位十六进制")
-        return await _resume(owner, _int(args[1], "作业"), args[2])
+        result = await start_resume(owner, _int(args[1], "作业"), args[2])
+        if not result["ok"]:
+            if result.get("error") == "busy":
+                return "已有批量执行在本进程中，不会并行启动第二个。"
+            detail = (result.get("blockers") or [{"detail": result.get("error") or "未执行"}])[0]["detail"]
+            return f"未执行：{detail}"
+        if result.get("idempotent"):
+            return f"作业 #{result['job_id']} 已在运行，不会并行启动第二个。"
+        return (
+            f"作业 #{result['job_id']} 已接受恢复。一次只传输一个文件；"
+            "失败、限流和远端复核都会停住并保留记录。"
+        )
     raise Refusal("args", "批量命令无法识别")
 
 
-async def _resume(owner, job_id: int, digest: str) -> str:
+async def start_resume(owner, job_id: int, digest: str) -> dict:
+    """Same gates as /bulk resume. A closed gate does not change the job state."""
+    blocked = jobs.blockers(
+        owner.db, job_id, digest, now=time.time(), directories=_directories(owner)
+    )
+    if blocked:
+        try:
+            status = jobs.get_job(owner.db, job_id)["state"]
+        except KeyError:
+            status = "missing"
+        return {
+            "ok": False, "error": "blocked", "job_id": int(job_id),
+            "status": status, "blockers": blocked,
+        }
+    job = jobs.get_job(owner.db, job_id)
+    if job["state"] == "running":
+        return {"ok": True, "job_id": int(job_id), "status": "running", "idempotent": True}
     lock = getattr(owner, "_channel_bulk_lock", None)
     if lock is None:
         lock = asyncio.Lock()
         owner._channel_bulk_lock = lock
     if lock.locked():
-        return "已有批量执行在本进程中，不会并行启动第二个。"
-    reason = jobs.rejection(
-        owner.db, job_id, digest, now=time.time(), directories=_directories(owner)
-    )
-    if reason:
-        return f"未执行：{reason}"
+        return {"ok": False, "error": "busy", "job_id": int(job_id)}
     ticket = object()
     owner._channel_bulk_ticket = ticket
     asyncio.create_task(_start_locked(owner, job_id, digest, lock, ticket))
-    return f"作业 #{job_id} 已接受恢复。一次只传输一个文件；失败、限流和远端复核都会停住并保留记录。"
+    return {"ok": True, "job_id": int(job_id), "status": "accepted", "idempotent": False}
 
 
 async def _start_locked(owner, job_id, digest, lock, ticket) -> None:
