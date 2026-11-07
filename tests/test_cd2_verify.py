@@ -14,6 +14,7 @@ from tg2cloud.channel_bulk.cd2api import (
     _request_headers,
     _varint,
     encode_subfiles,
+    encode_upload_page,
     files_from_subfiles,
     grpc_unary,
     read_back,
@@ -35,6 +36,20 @@ def _file_blob(file_id: str, name: str, size: int) -> bytes:
         + _field(37, 0, b"\x00")
     )
     return _grpc(_field(1, 2, body))
+
+
+def _raw_file(file_id: str, name: str, size: int) -> bytes:
+    return _grpc(
+        _field(1, 2, file_id.encode())
+        + _field(2, 2, name.encode())
+        + _field(4, 0, _varint(size))
+        + _field(34, 0, b"\x01")
+        + _field(37, 0, b"\x00")
+    )
+
+
+async def _no_sleep(_delay: float) -> None:
+    return None
 
 
 class CodecTests(unittest.TestCase):
@@ -182,9 +197,128 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(missing["items"][0]["accepted"])
                 audit = (root / "channel-bulk" / "audit.log").read_text(encoding="utf-8")
                 self.assertNotIn("library/clip.mp4", audit)
+
+                async def inconclusive(path, expected_size=None, **kwargs):
+                    del path, kwargs
+                    return {
+                        "scheme": "clouddrive2-file",
+                        "read_back": False,
+                        "cache_only": None,
+                        "destination_id": "file-kept",
+                        "size": expected_size,
+                        "dest_path": "library/clip.mp4",
+                        "is_cloud_file": True,
+                        "is_local": False,
+                        "listing": "ok",
+                        "upload_list": "inconclusive",
+                    }
+
+                with patch("tg2cloud.channel_bulk.cd2api.read_back", inconclusive):
+                    shown = await ask(sock, {
+                        "command": "remote.verify", "request_id": "verifyhold",
+                        "paths": ["library/clip.mp4"], "sizes": [4],
+                    })
+                self.assertFalse(shown["items"][0]["accepted"])
+                self.assertEqual(shown["items"][0]["listing"], "ok")
+                self.assertEqual(shown["items"][0]["upload_list"], "inconclusive")
+                self.assertEqual(shown["items"][0]["file_id"], "file-kept")
+                self.assertTrue(shown["items"][0]["size_ok"])
+                audit = (root / "channel-bulk" / "audit.log").read_text(encoding="utf-8")
+                self.assertNotIn("file-kept", audit)
+                self.assertNotIn("library/clip.mp4", audit)
             finally:
                 await control.close()
                 db.close()
+
+
+    async def test_single_file_lookup_and_upload_list_timeout(self):
+        from tg2cloud.channel_bulk.cd2api import idle_timeout
+
+        calls = []
+
+        async def direct(method, payload):
+            calls.append(method)
+            if method == "FindFileByPath":
+                return _raw_file("file-1", "clip.mp4", 10)
+            if method == "GetUploadFileList":
+                self.assertEqual(payload, encode_upload_page("clip.mp4", 1))
+                self.assertNotIn(b"\x08\x01", payload)
+                return _grpc(b"")
+            raise AssertionError(method)
+
+        observed = await read_back(
+            "library/clip.mp4", expected_size=10, rpc=direct, sleep=_no_sleep, rng=lambda: 0,
+        )
+        self.assertEqual(calls, ["FindFileByPath", "GetUploadFileList"])
+        self.assertEqual(assess(
+            observed, expected_size=10, expected_dest="library/clip.mp4", expected_fingerprint=None,
+        ), "accept")
+
+        async def upload_down(method, payload):
+            del payload
+            if method == "FindFileByPath":
+                return _raw_file("file-1", "clip.mp4", 10)
+            raise TimeoutError(method)
+
+        held = await read_back(
+            "library/clip.mp4", expected_size=10, rpc=upload_down, sleep=_no_sleep, rng=lambda: 0,
+        )
+        self.assertEqual(held["listing"], "ok")
+        self.assertEqual(held["upload_list"], "inconclusive")
+        self.assertEqual(held["destination_id"], "file-1")
+        self.assertFalse(held["read_back"])
+        self.assertEqual(assess(
+            held, expected_size=10, expected_dest="library/clip.mp4", expected_fingerprint=None,
+        ), "reject")
+
+        async def all_down(method, payload):
+            del method, payload
+            raise TimeoutError("down")
+
+        missed = await read_back(
+            "library/clip.mp4", expected_size=10, rpc=all_down, sleep=_no_sleep, rng=lambda: 0,
+        )
+        self.assertEqual(missed["listing"], "timeout")
+        self.assertEqual(missed["upload_list"], "not_asked")
+        self.assertFalse(missed["destination_id"])
+        self.assertNotEqual(missed["listing"], "missing")
+
+        async def absent(method, payload):
+            del method, payload
+            return _grpc(b"")
+
+        gone = await read_back(
+            "library/clip.mp4", expected_size=10, rpc=absent, sleep=_no_sleep, rng=lambda: 0,
+        )
+        self.assertEqual(gone["listing"], "missing")
+        self.assertFalse(gone["destination_id"])
+
+        attempts = {"upload": 0}
+
+        async def flaky(method, payload):
+            del payload
+            if method == "GetSearchResults":
+                return _file_blob("file-9", "clip.mp4", 10)
+            if method == "FindFileByPath":
+                raise TimeoutError("find")
+            if method == "GetSubFiles":
+                raise AssertionError("listing")
+            attempts["upload"] += 1
+            if attempts["upload"] < 3:
+                raise TimeoutError("upload")
+            return _grpc(b"")
+
+        recovered = await read_back(
+            "library/clip.mp4", expected_size=10, rpc=flaky, sleep=_no_sleep, rng=lambda: 0,
+        )
+        self.assertEqual(attempts["upload"], 3)
+        self.assertEqual(assess(
+            recovered, expected_size=10, expected_dest="library/clip.mp4", expected_fingerprint=None,
+        ), "accept")
+        with patch.dict(os.environ, {"TG2CLOUD_CD2_API_TIMEOUT_SECONDS": "90"}):
+            self.assertEqual(idle_timeout(), 90.0)
+        with patch.dict(os.environ, {"TG2CLOUD_CD2_API_TIMEOUT_SECONDS": "999"}):
+            self.assertEqual(idle_timeout(), 60.0)
 
 
 def safe(path: str) -> bool:

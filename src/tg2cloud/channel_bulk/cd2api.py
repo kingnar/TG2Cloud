@@ -1,22 +1,33 @@
 """CloudDrive2 gRPC read-back. WebDAV size and upload-task Finish are not proof.
 
-Documented service ``clouddrive.CloudDriveFileSrv`` (proto version 1.0.11):
-``GetSubFiles`` with ``forceRefresh`` and ``GetUploadFileList``. Authorization
-is ``Bearer`` from ``TG2CLOUD_CD2_API_TOKEN``. The local gRPC address is
-``TG2CLOUD_CD2_API_ADDRESS`` (default ``127.0.0.1:19798``). An optional path
-prefix is ``TG2CLOUD_CD2_API_ROOT``. Set ``TG2CLOUD_CD2_API_TLS=1`` for TLS.
+Documented service ``clouddrive.CloudDriveFileSrv`` (proto version 1.0.11).
+A known file is read with ``FindFileByPath``, then ``GetSearchResults``
+(``fuzzyMatch`` false), then ``GetSubFiles`` with ``forceRefresh``.
+``GetUploadFileList`` is filtered by file name and paged (``itemsPerPage``,
+``pageNumber``). ``getAll`` is not used. Authorization is ``Bearer`` from
+``TG2CLOUD_CD2_API_TOKEN``. Address ``TG2CLOUD_CD2_API_ADDRESS`` defaults to
+``127.0.0.1:19798``. Optional prefix ``TG2CLOUD_CD2_API_ROOT``. TLS when
+``TG2CLOUD_CD2_API_TLS=1``.
+
+Timing: ``TG2CLOUD_CD2_API_TIMEOUT_SECONDS`` (idle, default 60, range 5–120),
+``TG2CLOUD_CD2_API_CALL_SECONDS`` (whole RPC, default 120, range 10–180),
+``TG2CLOUD_CD2_API_RETRIES`` (default 3, range 1–5),
+``TG2CLOUD_CD2_API_RETRY_BASE_SECONDS`` (default 0.5, range 0.1–10).
 
 ``CloudDriveFile.id`` plus size, ``isCloudFile``, and ``isLocal=false`` is the
-evidence. ``fileHashes`` may contain MD5 or SHA1, not the local head/mid/tail
-sample SHA-256, so a hash is not required and is not treated as that sample.
-A missing token, a missing id, a size mismatch, or an upload still in progress
-stays fail-closed and keeps the local file.
+file evidence. ``fileHashes`` may contain MD5 or SHA1, not the local sample
+SHA-256, so that sample is not compared. After those retries, an upload-list
+timeout is ``upload_list_inconclusive``: the file id stays visible to
+``remote.verify``, and bulk success stays rejected. A completed listing that
+does not contain the name is ``missing``. A transport failure of every lookup
+is ``timeout``, which is not the same as a missing file.
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import posixpath
+import random
 import re
 import ssl
 from typing import Any
@@ -27,7 +38,13 @@ TOKEN_ENV = "TG2CLOUD_CD2_API_TOKEN"
 ADDRESS_ENV = "TG2CLOUD_CD2_API_ADDRESS"
 ROOT_ENV = "TG2CLOUD_CD2_API_ROOT"
 TLS_ENV = "TG2CLOUD_CD2_API_TLS"
+TIMEOUT_ENV = "TG2CLOUD_CD2_API_TIMEOUT_SECONDS"
+CALL_ENV = "TG2CLOUD_CD2_API_CALL_SECONDS"
+RETRY_ENV = "TG2CLOUD_CD2_API_RETRIES"
+BACKOFF_ENV = "TG2CLOUD_CD2_API_RETRY_BASE_SECONDS"
 DEFAULT_ADDRESS = "127.0.0.1:19798"
+_PAGE_SIZE = 50
+_MAX_PAGES = 4
 _ADDRESS = re.compile(r"^[A-Za-z0-9._-]{1,253}:([0-9]{1,5})$")
 _PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 _IN_PROGRESS = {0, 1, 3, 4, 7, 9, 10}
@@ -49,6 +66,35 @@ def address_from_env() -> tuple[str, int]:
     if not 1 <= port <= 65535:
         raise ValueError("bad-address")
     return raw.rsplit(":", 1)[0], port
+
+
+def _env_number(name: str, default: float, low: float, high: float, *, integer: bool) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw) if integer else float(raw)
+    except ValueError:
+        return default
+    if value < low or value > high:
+        return default
+    return value
+
+
+def idle_timeout() -> float:
+    return float(_env_number(TIMEOUT_ENV, 60, 5, 120, integer=False))
+
+
+def call_timeout() -> float:
+    return float(_env_number(CALL_ENV, 120, 10, 180, integer=False))
+
+
+def retry_attempts() -> int:
+    return int(_env_number(RETRY_ENV, 3, 1, 5, integer=True))
+
+
+def retry_base() -> float:
+    return float(_env_number(BACKOFF_ENV, 0.5, 0.1, 10, integer=False))
 
 
 def root_from_env() -> str:
@@ -104,8 +150,18 @@ def encode_subfiles(path: str) -> bytes:
     return _field(1, 2, path.encode()) + _field(2, 0, b"\x01")
 
 
-def encode_upload_list() -> bytes:
-    return _field(1, 0, b"\x01")
+def encode_search(path: str, name: str) -> bytes:
+    """Exact name search. ``fuzzyMatch`` stays at its proto3 default, false."""
+    return _field(1, 2, path.encode()) + _field(2, 2, name.encode()) + _field(3, 0, b"\x01")
+
+
+def encode_find(parent: str, name: str) -> bytes:
+    return _field(1, 2, parent.encode()) + _field(2, 2, name.encode())
+
+
+def encode_upload_page(name: str, page: int, per_page: int = _PAGE_SIZE) -> bytes:
+    """One filtered page. ``getAll`` is left false so the gateway does not dump every task."""
+    return _field(2, 0, _varint(per_page)) + _field(3, 0, _varint(page)) + _field(4, 2, name.encode())
 
 
 def parse_fields(buf: bytes) -> list[tuple[int, int, bytes]]:
@@ -193,20 +249,44 @@ def files_from_subfiles(blob: bytes) -> list[dict[str, Any]]:
     return found
 
 
+def _upload_item(payload: bytes) -> dict[str, Any]:
+    item = {"dest": "", "status": None}
+    for inner, iwire, ipayload in parse_fields(payload):
+        if inner == 2 and iwire == 2:
+            item["dest"] = _text(ipayload)
+        elif inner == 8 and iwire == 0:
+            item["status"], _ = _read_varint(ipayload, 0)
+    return item
+
+
 def uploads_from_list(blob: bytes) -> list[dict[str, Any]]:
     found = []
     for message in parse_messages(blob):
         for number, wire, payload in parse_fields(message):
-            if number != 2 or wire != 2:
-                continue
-            item = {"dest": "", "status": None}
-            for inner, iwire, ipayload in parse_fields(payload):
-                if inner == 2 and iwire == 2:
-                    item["dest"] = _text(ipayload)
-                elif inner == 8 and iwire == 0:
-                    item["status"], _ = _read_varint(ipayload, 0)
-            found.append(item)
+            if number == 2 and wire == 2:
+                found.append(_upload_item(payload))
     return found
+
+
+def parse_upload_page(blob: bytes) -> tuple[list[dict[str, Any]], int | None, int | None]:
+    items: list[dict[str, Any]] = []
+    total = filtered = None
+    for message in parse_messages(blob):
+        for number, wire, payload in parse_fields(message):
+            if number == 1 and wire == 0:
+                total, _ = _read_varint(payload, 0)
+            elif number == 6 and wire == 0:
+                filtered, _ = _read_varint(payload, 0)
+            elif number == 2 and wire == 2:
+                items.append(_upload_item(payload))
+    return items, total, filtered
+
+
+def file_from_unary(blob: bytes) -> dict[str, Any] | None:
+    messages = parse_messages(blob)
+    if len(messages) != 1:
+        return None
+    return parse_file(messages[0])
 
 
 def _hpack_int(value: int, prefix: int) -> bytes:
@@ -342,48 +422,66 @@ async def _read_frame(reader: asyncio.StreamReader):
     return header[3], header[4], int.from_bytes(header[5:9], "big") & 0x7FFFFFFF, payload
 
 
-async def grpc_unary(host: str, port: int, method: str, payload: bytes, token: str, *, tls: bool) -> bytes:
-    context = ssl.create_default_context() if tls else None
-    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=context), 10)
-    try:
-        headers = _request_headers(f"{host}:{port}", method, token)
-        body = b"\x00" + len(payload).to_bytes(4, "big") + payload
-        writer.write(_PREFACE)
-        writer.write(_frame(0x4, 0, 0, b""))
-        writer.write(_frame(0x1, 0x4, 1, headers))
-        writer.write(_frame(0x0, 0x1, 1, body))
-        await writer.drain()
-        data = bytearray()
-        status = None
-        while True:
-            ftype, flags, stream, frame = await asyncio.wait_for(_read_frame(reader), 20)
-            if ftype == 0x4 and not flags & 0x1:
-                writer.write(_frame(0x4, 0x1, 0, b""))
-                await writer.drain()
-            elif ftype == 0x6 and not flags & 0x1:
-                writer.write(_frame(0x6, 0x1, 0, frame[:8]))
-                await writer.drain()
-            elif ftype in {0x1, 0x9}:
-                decoded = _decode_headers(frame)
-                if "grpc-status" in decoded:
-                    status = decoded["grpc-status"]
-            elif ftype == 0x0 and stream == 1:
-                data += frame
-            elif ftype == 0x7:
-                raise ValueError("goaway")
-            if ftype == 0x0 and flags & 0x1:
-                break
-            if ftype in {0x1, 0x9} and flags & 0x1 and data:
-                break
-        if status not in {None, "0"}:
-            raise ValueError("grpc-status")
-        return bytes(data)
-    finally:
-        writer.close()
+async def grpc_unary(
+    host: str,
+    port: int,
+    method: str,
+    payload: bytes,
+    token: str,
+    *,
+    tls: bool,
+    idle_seconds: float | None = None,
+    call_seconds: float | None = None,
+) -> bytes:
+    idle = idle_timeout() if idle_seconds is None else idle_seconds
+    deadline = call_timeout() if call_seconds is None else call_seconds
+
+    async def _once() -> bytes:
+        context = ssl.create_default_context() if tls else None
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=context), min(15.0, idle),
+        )
         try:
-            await writer.wait_closed()
-        except Exception as exc:  # noqa: BLE001 - closing a finished stream is not a verification result
-            del exc
+            headers = _request_headers(f"{host}:{port}", method, token)
+            body = b"\x00" + len(payload).to_bytes(4, "big") + payload
+            writer.write(_PREFACE)
+            writer.write(_frame(0x4, 0, 0, b""))
+            writer.write(_frame(0x1, 0x4, 1, headers))
+            writer.write(_frame(0x0, 0x1, 1, body))
+            await writer.drain()
+            data = bytearray()
+            status = None
+            while True:
+                ftype, flags, stream, frame = await asyncio.wait_for(_read_frame(reader), idle)
+                if ftype == 0x4 and not flags & 0x1:
+                    writer.write(_frame(0x4, 0x1, 0, b""))
+                    await writer.drain()
+                elif ftype == 0x6 and not flags & 0x1:
+                    writer.write(_frame(0x6, 0x1, 0, frame[:8]))
+                    await writer.drain()
+                elif ftype in {0x1, 0x9}:
+                    decoded = _decode_headers(frame)
+                    if "grpc-status" in decoded:
+                        status = decoded["grpc-status"]
+                elif ftype == 0x0 and stream == 1:
+                    data += frame
+                elif ftype == 0x7:
+                    raise ValueError("goaway")
+                if ftype == 0x0 and flags & 0x1:
+                    break
+                if ftype in {0x1, 0x9} and flags & 0x1 and data:
+                    break
+            if status not in {None, "0"}:
+                raise ValueError("grpc-status")
+            return bytes(data)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception as exc:  # noqa: BLE001 - closing a finished stream is not a verification result
+                del exc
+
+    return await asyncio.wait_for(_once(), deadline)
 
 
 def _join(root: str, relative: str) -> str:
@@ -399,50 +497,181 @@ def _parent_and_name(path: str) -> tuple[str, str]:
     return parent, name
 
 
-async def read_back(relative_path: str, *, expected_size: int | None = None, rpc=None) -> dict[str, Any]:
-    """Return an observation. Missing credentials or any RPC failure is not success."""
-    failed = {"scheme": "clouddrive2-file", "read_back": False, "cache_only": None, "method": "api"}
+def _named(info: dict[str, Any] | None, name: str) -> bool:
+    if not info:
+        return False
+    full = str(info.get("full_path") or "").rstrip("/")
+    return info.get("name") == name or full.endswith("/" + name)
+
+
+def _cloud_proof(info: dict[str, Any] | None, name: str) -> bool:
+    return bool(
+        _named(info, name)
+        and info
+        and info.get("id")
+        and info.get("is_cloud_file") is True
+        and info.get("is_local") is False
+    )
+
+
+def _observation(
+    relative: str,
+    info: dict[str, Any] | None,
+    *,
+    listing: str,
+    upload_list: str,
+    proven: bool,
+) -> dict[str, Any]:
+    return {
+        "scheme": "clouddrive2-file",
+        "method": "api",
+        "read_back": proven,
+        "cache_only": False if proven else None,
+        "destination_id": "" if info is None else (info.get("id") or ""),
+        "size": None if info is None else info.get("size"),
+        "dest_path": relative,
+        "is_cloud_file": bool(info and info.get("is_cloud_file")),
+        "is_local": bool(info and info.get("is_local")),
+        "listing": listing,
+        "upload_list": upload_list,
+    }
+
+
+async def _retry(call, method: str, payload: bytes, *, attempts: int, base: float, sleep, rng) -> bytes:
+    error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return await call(method, payload)
+        except Exception as exc:  # noqa: BLE001 - one attempt is not the final result
+            error = exc
+            if attempt + 1 >= attempts:
+                break
+            delay = min(base * (2 ** attempt), 8.0) * (0.5 + float(rng()))
+            await sleep(delay)
+    raise error if error is not None else TimeoutError("cd2")
+
+
+async def _lookup(call, parent: str, name: str, *, attempts: int, base: float, sleep, rng):
+    """Return ``(info, listing)``. A finished directory list is the only ``missing`` signal."""
+    try:
+        found = file_from_unary(await _retry(
+            call, "FindFileByPath", encode_find(parent, name),
+            attempts=attempts, base=base, sleep=sleep, rng=rng,
+        ))
+        if _cloud_proof(found, name):
+            return found, "ok"
+    except Exception:  # noqa: BLE001 - fall through to the name search
+        found = None
+    try:
+        matches = [
+            item for item in files_from_subfiles(await _retry(
+                call, "GetSearchResults", encode_search(parent, name),
+                attempts=attempts, base=base, sleep=sleep, rng=rng,
+            ))
+            if _named(item, name)
+        ]
+        if len(matches) > 1:
+            return None, "ambiguous"
+        if len(matches) == 1 and _cloud_proof(matches[0], name):
+            return matches[0], "ok"
+    except Exception:  # noqa: BLE001 - fall through to the directory list
+        matches = None
+    try:
+        listed = [
+            item for item in files_from_subfiles(await _retry(
+                call, "GetSubFiles", encode_subfiles(parent),
+                attempts=attempts, base=base, sleep=sleep, rng=rng,
+            ))
+            if _named(item, name)
+        ]
+    except Exception:  # noqa: BLE001 - transport failure is not "file missing"
+        return None, "timeout"
+    if len(listed) > 1:
+        return None, "ambiguous"
+    if len(listed) == 1:
+        return listed[0], "ok"
+    return None, "missing"
+
+
+async def _upload_state(call, name: str, full: str, *, attempts: int, base: float, sleep, rng) -> str:
+    found: list[dict[str, Any]] = []
+    seen = 0
+    covered = False
+    try:
+        for page in range(1, _MAX_PAGES + 1):
+            blob = await _retry(
+                call, "GetUploadFileList", encode_upload_page(name, page),
+                attempts=attempts, base=base, sleep=sleep, rng=rng,
+            )
+            items, total, filtered = parse_upload_page(blob)
+            found.extend(items)
+            seen += len(items)
+            limit = filtered if filtered is not None else total
+            if len(items) < _PAGE_SIZE or (limit is not None and seen >= limit):
+                covered = True
+                break
+    except Exception:  # noqa: BLE001 - retries are inside _retry; this is the exhausted result
+        return "inconclusive"
+    busy = any(
+        item["dest"].rstrip("/").endswith("/" + name) or item["dest"].rstrip("/") == full.rstrip("/")
+        for item in found
+        if item["status"] in _IN_PROGRESS
+    )
+    if busy:
+        return "busy"
+    if not covered:
+        return "inconclusive"
+    return "clear"
+
+
+async def read_back(
+    relative_path: str,
+    *,
+    expected_size: int | None = None,
+    rpc=None,
+    sleep=None,
+    rng=None,
+) -> dict[str, Any]:
+    """Return an observation. Missing credentials or transport failure is not success."""
+    del expected_size
+    failed = {
+        "scheme": "clouddrive2-file", "read_back": False, "cache_only": None,
+        "method": "api", "listing": "failed", "upload_list": "not_asked",
+    }
     if not safe_relative(relative_path):
         return failed
     token = token_from_env()
     if rpc is None and not token:
-        return {"scheme": "webdav", "method": "size", "read_back": False, "cache_only": None}
+        return {"scheme": "webdav", "method": "size", "read_back": False, "cache_only": None, "listing": "skipped"}
+    parent, name = _parent_and_name(relative_path)
     try:
-        parent, name = _parent_and_name(relative_path)
         api_parent = _join(root_from_env(), parent)
-        if rpc is None:
+    except ValueError:
+        return failed
+    if rpc is None:
+        try:
             host, port = address_from_env()
-            tls = os.environ.get(TLS_ENV, "") == "1"
+        except ValueError:
+            return failed
+        tls = os.environ.get(TLS_ENV, "") == "1"
 
-            async def rpc(method, payload):
-                return await grpc_unary(host, port, method, payload, token, tls=tls)
-        listing = files_from_subfiles(await rpc("GetSubFiles", encode_subfiles(api_parent)))
-        matches = [item for item in listing if item["name"] == name]
-        uploads = uploads_from_list(await rpc("GetUploadFileList", encode_upload_list()))
-    except Exception:  # noqa: BLE001 - an API failure is not remote success
-        return failed
-    if len(matches) != 1:
-        return failed
-    info = matches[0]
-    full = info["full_path"] or _join(root_from_env(), relative_path)
-    busy = any(
-        item["dest"].rstrip("/").endswith("/" + name) or item["dest"].rstrip("/") == full.rstrip("/")
-        for item in uploads
-        if item["status"] in _IN_PROGRESS
+        async def rpc(method, payload, _host=host, _port=port, _tls=tls, _token=token):
+            return await grpc_unary(
+                _host, _port, method, payload, _token, tls=_tls,
+                idle_seconds=idle_timeout(), call_seconds=call_timeout(),
+            )
+    pause = asyncio.sleep if sleep is None else sleep
+    roll = random.random if rng is None else rng
+    attempts, base = retry_attempts(), retry_base()
+    info, listing = await _lookup(
+        rpc, api_parent, name, attempts=attempts, base=base, sleep=pause, rng=roll,
     )
-    if busy or not info["id"] or info["is_local"] or not info["is_cloud_file"]:
-        return failed | {"destination_id": info.get("id") or "", "size": info.get("size"), "dest_path": relative_path}
-    observation = {
-        "scheme": "clouddrive2-file",
-        "read_back": True,
-        "cache_only": False,
-        "destination_id": info["id"],
-        "size": info["size"],
-        "dest_path": relative_path,
-        "is_cloud_file": True,
-        "is_local": False,
-        "name": name,
-    }
-    if expected_size is not None and info["size"] != int(expected_size):
-        observation["read_back"] = True
-    return observation
+    if listing != "ok" or not _cloud_proof(info, name):
+        return _observation(relative_path, info if listing == "ok" else None, listing=listing, upload_list="not_asked", proven=False)
+    full = (info or {}).get("full_path") or _join(api_parent, name)
+    upload_list = await _upload_state(
+        rpc, name, str(full), attempts=attempts, base=base, sleep=pause, rng=roll,
+    )
+    return _observation(
+        relative_path, info, listing="ok", upload_list=upload_list, proven=upload_list == "clear",
+    )

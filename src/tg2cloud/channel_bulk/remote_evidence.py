@@ -8,7 +8,9 @@ a file read-back (``GetSubFiles`` with ``forceRefresh``) that returns
 ``CloudDriveFile.fileHashes`` may include MD5 or SHA1. It does not include the
 local head/mid/tail sample SHA-256, so that sample is not compared. If an
 observation nevertheless carries ``content_sha256``, it must match the local
-sample or the read-back is rejected.
+sample or the read-back is rejected. ``upload_list=inconclusive`` keeps the
+file id visible but is not acceptance. A listing ``timeout`` is not a missing
+file.
 """
 from __future__ import annotations
 
@@ -28,6 +30,10 @@ def assess(
     if observation.get("scheme") in {"webdav", "clouddrive2-upload-task"} or observation.get("method") == "size":
         return "reject"
     if observation.get("scheme") != "clouddrive2-file":
+        return "reject"
+    if observation.get("listing") not in {None, "ok"}:
+        return "reject"
+    if observation.get("upload_list") not in {None, "clear"}:
         return "reject"
     if observation.get("read_back") is not True or observation.get("cache_only") is not False:
         return "reject"

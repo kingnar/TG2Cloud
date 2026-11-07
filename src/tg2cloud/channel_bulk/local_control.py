@@ -446,12 +446,16 @@ class LocalControl:
             if not safe_relative(path) or type(size) is not int or isinstance(size, bool) or size < 0:
                 raise ValueError("bad-request")
             observed = await read_back(path, expected_size=size)
+            file_id = observed.get("destination_id") if isinstance(observed.get("destination_id"), str) else ""
             items.append({
                 "accepted": assess(
                     observed, expected_size=size, expected_dest=path, expected_fingerprint=None,
                 ) == "accept",
-                "has_file_id": bool(observed.get("destination_id")),
+                "has_file_id": bool(file_id),
                 "size_ok": observed.get("size") == size,
+                "listing": str(observed.get("listing") or "failed")[:32],
+                "upload_list": str(observed.get("upload_list") or "not_asked")[:32],
+                "file_id": file_id[:256],
             })
         return {
             "ok": True,
