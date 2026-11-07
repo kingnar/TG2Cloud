@@ -95,6 +95,9 @@ class TaskDB:
                 """
             )
             migrate(self._conn, columns)
+            from tg2cloud.channel_bulk.schema import ensure
+
+            ensure(self._conn)
 
 
     def is_paused(self) -> bool:
@@ -275,6 +278,7 @@ class TaskDB:
         target_base: str | None = None, created_at: float | None = None,
         classification_options: dict | None = None,
         directory_override: str | None = None, read_identity: str = "bot", source_id: int | None = None,
+        file_unique_id: str | None = None, bulk_job_id: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
         now = time.time() if created_at is None else created_at
         with self._lock:
@@ -285,8 +289,10 @@ class TaskDB:
                 # forwards must return the original persisted task unchanged.
                 row = self._conn.execute(
                     "SELECT * FROM tasks WHERE (chat_id=? AND message_id=?) "
-                    "OR (sender_id=? AND media_key=? AND ? IS NOT NULL) LIMIT 1",
-                    (chat_id, message_id, sender_id, media_key, media_key)).fetchone()
+                    "OR (sender_id=? AND media_key=? AND ? IS NOT NULL) "
+                    "OR (file_unique_id IS NOT NULL AND ? IS NOT NULL AND file_unique_id=?) LIMIT 1",
+                    (chat_id, message_id, sender_id, media_key, media_key,
+                     file_unique_id, file_unique_id)).fetchone()
                 if row:
                     self._conn.execute("RELEASE create_task" if nested else "COMMIT")
                     return dict(row), False
@@ -304,8 +310,9 @@ class TaskDB:
                     INSERT INTO tasks (
                         chat_id, message_id, sender_id, media_key, file_name,
                         file_size, state, created_at, updated_at, original_file_name,
-                        target_directory, target_base, read_identity, source_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+                        target_directory, target_base, read_identity, source_id,
+                        file_unique_id, bulk_job_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         chat_id,
@@ -318,6 +325,7 @@ class TaskDB:
                         now,
                         original_file_name,
                         target_directory, target_base, read_identity, source_id,
+                        file_unique_id, bulk_job_id,
                     ),
                 )
                 row = self._conn.execute(
@@ -342,6 +350,11 @@ class TaskDB:
                         WHERE sender_id = ? AND media_key = ?
                         """,
                         (sender_id, media_key),
+                    ).fetchone()
+                if row is None and file_unique_id:
+                    row = self._conn.execute(
+                        "SELECT * FROM tasks WHERE file_unique_id=? LIMIT 1",
+                        (file_unique_id,),
                     ).fetchone()
                 if row is None:
                     raise

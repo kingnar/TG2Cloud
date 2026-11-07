@@ -356,7 +356,9 @@ class CommandHandlers:
         parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
         actor = current_user(self.settings.allowed_user_id)
-        if actor != self.settings.allowed_user_id and command in {"/pause", "/resume", "/doctor", "/orphans"}:
+        if actor != self.settings.allowed_user_id and command in {
+            "/pause", "/resume", "/doctor", "/orphans", "/inventory", "/bulk",
+        }:
             await event.reply("此操作仅限管理员；你可以转存和管理自己的任务。")
             return
         if command in {"/task", "/watch", "/retry", "/cancel", "/stream", "/confirm", "/restart", "/recover"}:
@@ -429,6 +431,10 @@ class CommandHandlers:
             await self._command_retry(event, parts)
         elif command == "/cancel":
             await self._command_cancel(event, parts)
+        elif command in {"/inventory", "/bulk"}:
+            from tg2cloud.channel_bulk.control import handle as channel_bulk_handle
+
+            await event.reply(await channel_bulk_handle(self, parts))
         else:
             await event.reply("未知命令。发送 /help 查看可用命令。")
 
