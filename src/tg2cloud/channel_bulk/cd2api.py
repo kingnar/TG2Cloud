@@ -3,8 +3,8 @@
 Documented service ``clouddrive.CloudDriveFileSrv`` (proto version 1.0.11).
 A known file is read with ``FindFileByPath``, then ``GetSearchResults``
 (``fuzzyMatch`` false), then ``GetSubFiles`` with ``forceRefresh``.
-The active upload queue is ``GetUploadFileCount``. Zero means nothing is
-uploading. ``GetUploadFileList`` is used only when that count is non-zero, and
+The active upload queue is ``GetUploadFileCount``. A completed call whose
+protobuf is empty means the count is zero. A timeout is not zero. ``GetUploadFileList`` is used only when that count is non-zero, and
 only as ``getAll`` (field 1 = true). A name filter plus page is not sent: on
 this gateway that shape times out even when the panel queue is idle.
 Authorization is ``Bearer`` from
@@ -475,11 +475,14 @@ async def grpc_unary(
                         pending = 0
                 elif ftype == 0x7:
                     raise ValueError("goaway")
-                if ftype == 0x0 and flags & 0x1:
-                    break
-                if ftype in {0x1, 0x9} and flags & 0x1 and data:
+                # A count of zero is an empty protobuf. gRPC then ends the
+                # stream on the trailer HEADERS and may send no DATA frame.
+                # Waiting for DATA turns that idle queue into a timeout.
+                if ftype in {0x0, 0x1, 0x9} and flags & 0x1:
                     break
             if status not in {None, "0"}:
+                raise ValueError("grpc-status")
+            if not data and status is None:
                 raise ValueError("grpc-status")
             return bytes(data)
         finally:

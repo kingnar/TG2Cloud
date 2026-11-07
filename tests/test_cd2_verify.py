@@ -171,6 +171,60 @@ class ReadBackTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("test-token", text)
         self.assertIn("Bearer [REDACTED]", text)
 
+    async def test_empty_count_completes_on_trailers_and_silence_is_not_idle(self):
+        from tg2cloud.channel_bulk.cd2api import _PREFACE, _frame, parse_upload_count
+
+        async def serve(reader, writer):
+            await reader.readexactly(len(_PREFACE))
+            while True:
+                header = await reader.readexactly(9)
+                length = int.from_bytes(header[:3], "big")
+                flags = header[4]
+                ftype = header[3]
+                if length:
+                    await reader.readexactly(length)
+                if ftype == 0 and flags & 1:
+                    break
+            writer.write(_frame(0x4, 0, 0, b""))
+            writer.write(_frame(0x4, 0x1, 0, b""))
+            writer.write(_frame(0x1, 0x4, 1, _literal(":status", "200")))
+            writer.write(_frame(0x1, 0x5, 1, _literal("grpc-status", "0")))
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            blob = await grpc_unary(
+                "127.0.0.1", port, "GetUploadFileCount", b"", "test-token",
+                tls=False, idle_seconds=2, call_seconds=3,
+            )
+        finally:
+            server.close()
+            await server.wait_closed()
+        self.assertEqual(blob, b"")
+        self.assertEqual(parse_upload_count(blob), 0)
+
+        async def silent(reader, writer):
+            try:
+                await reader.readexactly(len(_PREFACE))
+                await asyncio.sleep(2)
+            except asyncio.IncompleteReadError:
+                return
+            writer.close()
+
+        stalled = await asyncio.start_server(silent, "127.0.0.1", 0)
+        stalled_port = stalled.sockets[0].getsockname()[1]
+        try:
+            with self.assertRaises(TimeoutError):
+                await grpc_unary(
+                    "127.0.0.1", stalled_port, "GetUploadFileCount", b"", "test-token",
+                    tls=False, idle_seconds=0.2, call_seconds=0.4,
+                )
+        finally:
+            stalled.close()
+            await stalled.wait_closed()
+
     async def test_verify_command_rejects_escape_and_missing_token(self):
         import tempfile
 
