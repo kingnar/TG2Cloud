@@ -607,6 +607,99 @@ class ChannelBulkTests(unittest.TestCase):
         )
         self.assertEqual(jobs.get_job(self.db, job["id"])["manifest_hash"], built["hash"])
 
+    def test_preview_rebuild_drops_reposted_media_even_when_dedup_column_is_new(self):
+        """a9cb8b1 stored every non-task row as dedup=new. Reposts share media_key."""
+        approved = list(range(1, 1413))
+        duplicates = list(range(5000, 5053))
+        pending = list(range(6000, 6013))
+        transferred = list(range(7000, 7081))
+        wrong_hash = "53632b26cb7aa8655b52fa3c13382a7da6294178e5d016a1051678adcbbfc155"
+        row = inventory.start(self.db, -100555, now=self.clock.now())
+
+        def store(message_id, duration, media_key):
+            self.db._conn.execute(
+                """INSERT INTO channel_inventory_items(
+                    inventory_id, message_id, link, duration, size, group_id, media_key,
+                    file_unique_id, mime, file_name, dedup
+                ) VALUES(?,?,?,?,?,?,?,?,?,?, 'new')""",
+                (
+                    row["id"], message_id, f"https://t.me/c/555/{message_id}", duration, 10, "",
+                    media_key, None, "video/mp4", f"clip-{message_id}.mp4",
+                ),
+            )
+
+        for message_id in approved:
+            store(message_id, 90, f"document:{message_id}")
+        for offset, message_id in enumerate(duplicates):
+            store(message_id, 90, f"document:{approved[offset]}")
+        for message_id in pending:
+            store(message_id, 4, f"document:short-{message_id}")
+        for message_id in transferred:
+            store(message_id, 90, f"document:done-{message_id}")
+            created, _ = self.db.create_task(
+                chat_id=-100555, message_id=message_id, sender_id=1,
+                media_key=f"document:done-{message_id}",
+                file_name=f"done-{message_id}.mp4", file_size=10,
+            )
+            self.db._conn.execute(
+                "UPDATE tasks SET state='completed' WHERE id=?", (created["id"],)
+            )
+        job = jobs.open_job(self.db, row["id"], "media", now=self.clock.now())
+        self.db._conn.executemany(
+            """INSERT INTO channel_bulk_items(job_id, message_id, status, attempts, bytes_charged)
+               VALUES(?, ?, 'pending', 0, 0)""",
+            [(job["id"], message_id) for message_id in approved + duplicates],
+        )
+        self.db._conn.execute(
+            "UPDATE channel_bulk_jobs SET manifest_hash=? WHERE id=?", (wrong_hash, job["id"]),
+        )
+        preview = jobs.manifest(
+            self.db, job["id"], now=self.clock.now(), through=8000, expand=False, dry_run=True,
+        )
+        self.assertEqual(preview["reasons"]["included"], 1412)
+        self.assertEqual(preview["reasons"]["dup_in_channel"], 53)
+        self.assertEqual(preview["reasons"]["review_pending"], 13)
+        self.assertEqual(preview["reasons"]["transferred"], 81)
+        self.assertEqual(preview["ids"], approved)
+        self.assertEqual(jobs.get_job(self.db, job["id"])["manifest_hash"], wrong_hash)
+        self.assertEqual(
+            self.db._conn.execute(
+                "SELECT COUNT(*) FROM channel_bulk_items WHERE job_id=?", (job["id"],)
+            ).fetchone()[0],
+            1465,
+        )
+        built = jobs.manifest(self.db, job["id"], now=self.clock.now(), through=8000, expand=False)
+        self.assertEqual(built["ids"], approved)
+        self.assertEqual(built["count"], 1412)
+        self.assertEqual(built["superseded_hash"], wrong_hash)
+        self.assertNotEqual(built["hash"], wrong_hash)
+        again = jobs.manifest(self.db, job["id"], now=self.clock.now(), through=8000, expand=False)
+        self.assertEqual(again["ids"], built["ids"])
+        self.assertEqual(again["hash"], built["hash"])
+        self.assertEqual(again["superseded_hash"], "")
+        with self.assertRaises(jobs.Refusal) as refused:
+            jobs.prepare_resume(
+                self.db, job["id"], wrong_hash, now=self.clock.now(), disk_free=10**12, min_free=0,
+                directories={"media": "library/videos"},
+            )
+        self.assertEqual(refused.exception.code, "manifest")
+        running_items = [
+            int(item[0]) for item in self.db._conn.execute(
+                "SELECT message_id FROM channel_bulk_items WHERE job_id=? ORDER BY message_id",
+                (job["id"],),
+            )
+        ]
+        self.db._conn.execute("UPDATE channel_bulk_jobs SET state='running' WHERE id=?", (job["id"],))
+        with self.assertRaises(jobs.Refusal):
+            jobs.manifest(self.db, job["id"], now=self.clock.now(), through=8000, expand=False)
+        self.assertEqual(
+            [int(item[0]) for item in self.db._conn.execute(
+                "SELECT message_id FROM channel_bulk_items WHERE job_id=? ORDER BY message_id",
+                (job["id"],),
+            )],
+            running_items,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

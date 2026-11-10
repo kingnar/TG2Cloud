@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import json
 
-from tg2cloud.channel_bulk.dedup import classify, effective_dedup
+from tg2cloud.channel_bulk.dedup import (
+    classify,
+    effective_dedup,
+    intra_channel_duplicate_ids,
+)
 from tg2cloud.channel_bulk.inventory import exclusions, items
 from tg2cloud.channel_bulk.ledger import Refusal, attestation, attested_remaining
 from tg2cloud.channel_bulk.policy import canonical_manifest, selected
@@ -156,7 +160,71 @@ def set_whitelist(db, job_id: int, aliases: list[str], *, now: float) -> dict:
     return get_job(db, job_id)
 
 
-def manifest(db, job_id: int, *, now: float, through: int | None = None, expand: bool = False) -> dict:
+_REASON_KEYS = (
+    "included",
+    "dup_in_channel",
+    "transferred",
+    "active",
+    "blocked",
+    "review_pending",
+    "excluded",
+    "above_through",
+    "frozen",
+)
+
+
+def _manifest_plan(db, job: dict, *, through: int | None, expand: bool) -> dict:
+    """Classify every inventoried message. Does not write."""
+    rows = items(db, job["inventory_id"])
+    excluded = exclusions(db, job["chat_id"])
+    duplicates = intra_channel_duplicate_ids(rows)
+    with db._lock:
+        previous = {
+            int(row[0])
+            for row in db._conn.execute(
+                "SELECT message_id FROM channel_bulk_items WHERE job_id=?", (int(job["id"]),)
+            )
+        }
+    frozen = bool(job["manifest_hash"]) and not expand
+    reasons = {key: 0 for key in _REASON_KEYS}
+    chosen = []
+    held_back = 0
+    controls = job["controls"]
+    for row in sorted(rows, key=lambda item: int(item["message_id"])):
+        message_id = int(row["message_id"])
+        label = str(row["dedup"] or "new")
+        if label == "new" and message_id in duplicates:
+            label = "dup_in_channel"
+        eligible = (
+            message_id not in excluded
+            and label == "new"
+            and selected(row, excluded=set(), dedup="new", controls=controls)
+        )
+        if through is not None and message_id > int(through):
+            reason = "above_through"
+            if eligible:
+                held_back += 1
+        elif message_id in excluded:
+            reason = "excluded"
+        elif label == "completed":
+            reason = "transferred"
+        elif label in {"active", "blocked", "dup_in_channel"}:
+            reason = label
+        elif label != "new":
+            reason = "dup_in_channel"
+        elif not selected(row, excluded=set(), dedup="new", controls=controls):
+            reason = "review_pending"
+        elif frozen and message_id not in previous:
+            reason = "frozen"
+            held_back += 1
+        else:
+            reason = "included"
+            chosen.append(message_id)
+        reasons[reason] += 1
+    return {"ids": chosen, "held_back": held_back, "reasons": reasons}
+
+
+def manifest(db, job_id: int, *, now: float, through: int | None = None, expand: bool = False, dry_run: bool = False) -> dict:
     """Rebuild the reviewed id list and its hash. Does not start transfers.
 
     ``through`` is the highest message id the operator has reviewed. Newer ids
@@ -164,40 +232,32 @@ def manifest(db, job_id: int, *, now: float, through: int | None = None, expand:
     is explicit, and even then they cannot pass ``through``.
     """
     job = get_job(db, job_id)
-    if job["state"] not in OPEN_STATES:
-        raise Refusal("state", "运行中的作业不能改清单")
     if through is not None and (type(through) is not int or isinstance(through, bool) or through <= 0):
         raise Refusal("manifest", "审核上界必须是正整数消息编号")
-    if _transfer_started(db, job_id):
+    if not dry_run and job["state"] not in OPEN_STATES:
+        raise Refusal("state", "运行中的作业不能改清单")
+    if not dry_run and _transfer_started(db, job_id):
         raise Refusal("manifest", "已有传输记录，不能重建清单")
-    rows = items(db, job["inventory_id"])
-    excluded = exclusions(db, job["chat_id"])
-    with db._lock:
-        previous = {
-            int(row[0])
-            for row in db._conn.execute(
-                "SELECT message_id FROM channel_bulk_items WHERE job_id=?", (int(job_id),)
-            )
-        }
-    frozen = bool(job["manifest_hash"]) and not expand
-    chosen = []
-    held_back = 0
-    for row in sorted(rows, key=lambda item: int(item["message_id"])):
-        message_id = int(row["message_id"])
-        if not selected(row, excluded=excluded, dedup=row["dedup"], controls=job["controls"]):
-            continue
-        if through is not None and message_id > int(through):
-            held_back += 1
-            continue
-        if frozen and message_id not in previous:
-            held_back += 1
-            continue
-        chosen.append(message_id)
+    plan = _manifest_plan(db, job, through=through, expand=expand)
+    chosen = plan["ids"]
+    held_back = plan["held_back"]
     previous_hash = str(job["manifest_hash"] or "")
     digest = canonical_manifest(
         job_id, job["chat_id"], job["directory_alias"], job["whitelist"], job["controls"], chosen,
         through=through,
     )
+    result = {
+        "hash": digest,
+        "count": len(chosen),
+        "ids": chosen,
+        "through": through,
+        "held_back": held_back,
+        "reasons": plan["reasons"],
+        "dry_run": dry_run,
+        "superseded_hash": previous_hash if previous_hash and previous_hash != digest else "",
+    }
+    if dry_run:
+        return result
     with db._lock:
         db._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -218,14 +278,7 @@ def manifest(db, job_id: int, *, now: float, through: int | None = None, expand:
         except BaseException:
             db._conn.execute("ROLLBACK")
             raise
-    return {
-        "hash": digest,
-        "count": len(chosen),
-        "ids": chosen,
-        "through": through,
-        "held_back": held_back,
-        "superseded_hash": previous_hash if previous_hash and previous_hash != digest else "",
-    }
+    return result
 
 
 def blockers(db, job_id: int, manifest_hash: str, *, now: float, directories: dict[str, str]) -> list[dict]:

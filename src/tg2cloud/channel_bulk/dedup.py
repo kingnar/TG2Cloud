@@ -26,6 +26,36 @@ def _has_column(db, name: str) -> bool:
     return name in columns
 
 
+def intra_channel_duplicate_ids(rows: list[dict]) -> set[int]:
+    """Later messages that repeat an earlier file in the same inventory.
+
+    Inventory scans store ``dedup='new'`` unless a task row exists. A repost
+    still shares ``media_key`` (``document:<id>``) or ``file_unique_id``.
+    The earliest message id stays eligible. Empty identities do not group.
+    """
+    first_media: dict[str, int] = {}
+    first_unique: dict[str, int] = {}
+    ordered = sorted(rows, key=lambda row: int(row["message_id"]))
+    for row in ordered:
+        message_id = int(row["message_id"])
+        media = str(row.get("media_key") or "")
+        unique = str(row.get("file_unique_id") or "")
+        if media and media not in first_media:
+            first_media[media] = message_id
+        if unique and unique not in first_unique:
+            first_unique[unique] = message_id
+    duplicates = set()
+    for row in ordered:
+        message_id = int(row["message_id"])
+        media = str(row.get("media_key") or "")
+        unique = str(row.get("file_unique_id") or "")
+        if (media and first_media.get(media, message_id) < message_id) or (
+            unique and first_unique.get(unique, message_id) < message_id
+        ):
+            duplicates.add(message_id)
+    return duplicates
+
+
 def effective_dedup(stored: str | None, live: str) -> str:
     """Keep a reviewed non-new label when the task table still says new."""
     if live != "new":

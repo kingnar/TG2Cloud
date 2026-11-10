@@ -528,8 +528,12 @@ class LocalControl:
                 raise Refusal("manifest", "through_message_id 必须是已审核到的最大消息编号")
             if "expand" in request and type(request.get("expand")) is not bool:
                 raise ValueError("bad-request")
+            if "dry_run" in request and type(request.get("dry_run")) is not bool:
+                raise ValueError("bad-request")
+            dry_run = request.get("dry_run") is True
             built = jobs.manifest(
-                self.owner.db, job_id, now=now, through=through, expand=request.get("expand") is True,
+                self.owner.db, job_id, now=now, through=through,
+                expand=request.get("expand") is True, dry_run=dry_run,
             )
             return {
                 "ok": True,
@@ -538,6 +542,8 @@ class LocalControl:
                 "count": built["count"],
                 "through": through,
                 "held_back": built["held_back"],
+                "reasons": built["reasons"],
+                "dry_run": dry_run,
                 "superseded_hash": built.get("superseded_hash") or "",
             }
         if command == "bulk.resume":
