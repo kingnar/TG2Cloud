@@ -262,7 +262,7 @@ async def _download(ctx, job, task, media, local: Path) -> None:
     part = Path(str(local) + ".part")
     _begin_download(ctx.db, int(task["id"]), str(part))
     part.parent.mkdir(parents=True, exist_ok=True)
-    rate = ByteRate(int(job["controls"]["down_bps"]), monotonic=ctx.monotonic, sleep=ctx.sleep)
+    rate = ByteRate(lambda: get_job(ctx.db, job["id"])["controls"]["down_bps"], monotonic=ctx.monotonic, sleep=ctx.sleep)
     payload = dict(media)
     payload["chat_id"] = int(job["chat_id"])
     await ctx.transport.download(item=payload, path=part, rate=rate, size=int(media["size"]))
@@ -294,7 +294,7 @@ async def _upload(ctx, job, task, media, local: Path, item: dict) -> str:
     if not local.is_file():
         pause(ctx.db, job["id"], now=ctx.now(), error="本地文件缺失，批量暂停")
         return "local"
-    rate = ByteRate(int(job["controls"]["up_bps"]), monotonic=ctx.monotonic, sleep=ctx.sleep)
+    rate = ByteRate(lambda: get_job(ctx.db, job["id"])["controls"]["up_bps"], monotonic=ctx.monotonic, sleep=ctx.sleep)
     remote = _remote_name(ctx.directory, task)
     if task["state"] == "waiting_upload":
         ctx.db.transition(int(task["id"]), "uploading", remote_temp_path=remote, error=None)

@@ -14,6 +14,15 @@ from tg2cloud.channel_bulk.transfer import listener_busy, run_job
 _ALIAS = re.compile(r"^.{1,32}$")
 
 
+def _rate_token(value: str, name: str):
+    if value == "unlimited":
+        return "unlimited"
+    number = _int(value, name)
+    if number <= 0:
+        raise Refusal("rate", f"{name} 必须是正整数或明确的 unlimited")
+    return number
+
+
 def _int(value: str, name: str) -> int:
     if not re.fullmatch(r"-?\d{1,18}", value or ""):
         raise Refusal("args", f"{name} 必须是整数")
@@ -183,7 +192,7 @@ async def _bulk(owner, args: list[str]) -> str:
         job = jobs.update_controls(
             owner.db, _int(args[1], "作业"), now=time.time(),
             daily_bytes=_int(args[2], "每日"), monthly_bytes=_int(args[3], "每月"),
-            down_bps=_int(args[4], "下行"), up_bps=_int(args[5], "上行"),
+            down_bps=_rate_token(args[4], "下行"), up_bps=_rate_token(args[5], "上行"),
         )
         return f"作业 #{job['id']} 已记录本地额度与速率。这不是供应商账单。"
     if action == "whitelist" and len(args) == 3:

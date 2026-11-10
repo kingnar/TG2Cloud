@@ -700,6 +700,59 @@ class ChannelBulkTests(unittest.TestCase):
             running_items,
         )
 
+    def test_running_limits_keep_hash_and_unlimited_is_explicit(self):
+        from tg2cloud.channel_bulk.local_control import _rate_value
+
+        job = self._job_with([video(70, duration=90, size=100), video(71, duration=90, size=100)])
+        self._arm(job["id"], daily=10**6, monthly=10**6)
+        current = jobs.get_job(self.db, job["id"])
+        digest = current["manifest_hash"]
+        self.assertTrue(digest)
+        self.assertEqual(current["state"], "running")
+        self.db._conn.execute(
+            "UPDATE channel_bulk_items SET status='done' WHERE job_id=? AND message_id=70",
+            (job["id"],),
+        )
+        attest_before = self.db._conn.execute(
+            "SELECT remaining_bytes, period_end FROM channel_quota_attestation WHERE id=1"
+        ).fetchone()
+        updated = jobs.update_controls(
+            self.db, job["id"], now=self.clock.now(),
+            daily_bytes=480 * 1024**3, monthly_bytes=3400 * 1024**3,
+            down_bps="unlimited", up_bps="unlimited",
+        )
+        self.assertEqual(updated["state"], "running")
+        self.assertEqual(updated["manifest_hash"], digest)
+        self.assertTrue(updated["controls"]["egress_ack"])
+        self.assertEqual(updated["controls"]["down_bps"], "unlimited")
+        self.assertEqual(updated["controls"]["up_bps"], "unlimited")
+        attest_after = self.db._conn.execute(
+            "SELECT remaining_bytes, period_end FROM channel_quota_attestation WHERE id=1"
+        ).fetchone()
+        self.assertEqual(tuple(attest_after), tuple(attest_before))
+        self.assertFalse(charge(
+            self.db, 10**6 + 1, now=self.clock.now(), daily_cap=10**6, monthly_cap=10**6,
+        ))
+        sleeps = []
+
+        async def record(seconds):
+            sleeps.append(seconds)
+
+        rate = ByteRate(lambda: jobs.get_job(self.db, job["id"])["controls"]["down_bps"], monotonic=self.clock.monotonic, sleep=record)
+        asyncio.run(rate.consume(10**9))
+        self.assertEqual(sleeps, [])
+        self.assertEqual(_rate_value("unlimited", "down_bps"), "unlimited")
+        with self.assertRaises(jobs.Refusal):
+            _rate_value(0, "down_bps")
+        with self.assertRaises(jobs.Refusal):
+            _rate_value(None, "up_bps")
+        with self.assertRaises(jobs.Refusal):
+            jobs.update_controls(self.db, job["id"], now=self.clock.now(), min_duration=31)
+        self.assertEqual(jobs.get_job(self.db, job["id"])["manifest_hash"], digest)
+        jobs.pause(self.db, job["id"], now=self.clock.now(), error=None)
+        cleared = jobs.update_controls(self.db, job["id"], now=self.clock.now(), min_duration=31)
+        self.assertEqual(cleared["manifest_hash"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

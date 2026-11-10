@@ -14,6 +14,8 @@ from tg2cloud.channel_bulk.policy import canonical_manifest, selected
 from tg2cloud.channel_bulk.schema import ensure_db
 
 OPEN_STATES = ("preview", "paused")
+LIVE_STATES = ("preview", "paused", "running")
+MANIFEST_CONTROL_KEYS = {"min_duration", "allow"}
 
 
 def _controls(row: dict) -> dict:
@@ -35,18 +37,29 @@ def get_job(db, job_id: int) -> dict:
     return result
 
 
-def _save_controls(db, job_id: int, controls: dict, whitelist: list[str] | None, now: float) -> None:
+def rate_configured(value) -> bool:
+    """True only for a positive integer or the exact string ``unlimited``. ``0`` is not unlimited."""
+    if value == "unlimited":
+        return True
+    return type(value) is int and not isinstance(value, bool) and value > 0
+
+
+def _save_controls(
+    db, job_id: int, controls: dict, whitelist: list[str] | None, now: float, *, clear_hash: bool, states: tuple[str, ...],
+) -> None:
+    state_sql = ",".join("?" for _ in states)
+    hash_sql = "manifest_hash='', " if clear_hash else ""
     with db._lock:
         if whitelist is None:
             db._conn.execute(
-                "UPDATE channel_bulk_jobs SET controls=?, manifest_hash='', updated_at=? WHERE id=? AND state IN ('preview','paused')",
-                (json.dumps(controls, sort_keys=True), now, int(job_id)),
+                f"UPDATE channel_bulk_jobs SET controls=?, {hash_sql}updated_at=? WHERE id=? AND state IN ({state_sql})",
+                (json.dumps(controls, sort_keys=True), now, int(job_id), *states),
             )
         else:
             db._conn.execute(
-                """UPDATE channel_bulk_jobs SET controls=?, whitelist=?, manifest_hash='', updated_at=?
-                   WHERE id=? AND state IN ('preview','paused')""",
-                (json.dumps(controls, sort_keys=True), json.dumps(whitelist), now, int(job_id)),
+                f"""UPDATE channel_bulk_jobs SET controls=?, whitelist=?, {hash_sql}updated_at=?
+                   WHERE id=? AND state IN ({state_sql})""",
+                (json.dumps(controls, sort_keys=True), json.dumps(whitelist), now, int(job_id), *states),
             )
 
 
@@ -106,18 +119,24 @@ def open_job(db, inventory_id: int, alias: str, *, now: float) -> dict:
 
 def update_controls(db, job_id: int, *, now: float, **changes) -> dict:
     job = get_job(db, job_id)
-    if job["state"] not in OPEN_STATES:
-        raise Refusal("state", "只有预览或暂停中的作业可以改配置")
+    if not changes:
+        raise Refusal("config", "没有要修改的控制项")
+    manifest_change = any(key in MANIFEST_CONTROL_KEYS for key in changes)
+    allowed = OPEN_STATES if manifest_change else LIVE_STATES
+    if job["state"] not in allowed:
+        raise Refusal("state", "当前状态不能改这些配置")
     controls = dict(job["controls"])
     for key, value in changes.items():
         if key not in controls:
             raise Refusal("config", "未知控制项")
         controls[key] = value
     _validate_controls(controls)
-    _save_controls(db, job_id, controls, None, now)
+    _save_controls(db, job_id, controls, None, now, clear_hash=manifest_change, states=allowed)
     saved = get_job(db, job_id)
-    if saved["controls"] != controls:
-        raise Refusal("state", "作业已不在预览或暂停，配置未改")
+    if saved["controls"] != controls or (manifest_change and saved["manifest_hash"]):
+        raise Refusal("state", "配置未改")
+    if not manifest_change and saved["manifest_hash"] != job["manifest_hash"]:
+        raise Refusal("state", "配置未改")
     return saved
 
 
@@ -131,9 +150,15 @@ def _validate_controls(controls: dict) -> None:
         or any(type(item) is not int or item <= 0 for item in allow)
     ):
         raise Refusal("config", "复核允许列表无效")
-    for key in ("daily_bytes", "monthly_bytes", "down_bps", "up_bps"):
-        if type(controls[key]) is not int or controls[key] < 0 or controls[key] > 2**62:
-            raise Refusal("config", "额度或速率无效")
+    for key in ("daily_bytes", "monthly_bytes"):
+        if type(controls[key]) is not int or isinstance(controls[key], bool) or controls[key] < 0 or controls[key] > 2**62:
+            raise Refusal("config", "额度无效")
+    for key in ("down_bps", "up_bps"):
+        value = controls[key]
+        if value == "unlimited":
+            continue
+        if type(value) is not int or isinstance(value, bool) or value < 0 or value > 2**62:
+            raise Refusal("config", "速率无效；0 不是无限")
     if controls["daily_bytes"] and controls["monthly_bytes"] and controls["daily_bytes"] > controls["monthly_bytes"]:
         raise Refusal("config", "每日额度不能大于每月额度")
     if type(controls["max_attempts"]) is not int or not 1 <= controls["max_attempts"] <= 5:
@@ -156,7 +181,7 @@ def set_whitelist(db, job_id: int, aliases: list[str], *, now: float) -> dict:
             clean.append(alias)
     if job["directory_alias"] not in clean:
         raise Refusal("whitelist", "目标别名必须留在白名单内")
-    _save_controls(db, job_id, job["controls"], clean, now)
+    _save_controls(db, job_id, job["controls"], clean, now, clear_hash=True, states=OPEN_STATES)
     return get_job(db, job_id)
 
 
@@ -326,12 +351,12 @@ def blockers(db, job_id: int, manifest_hash: str, *, now: float, directories: di
             "fields": missing_budget,
             "detail": "每日和每月字节上限必须是正整数；0 不是无限，程序也不会填供应商额度",
         })
-    missing_rate = [name for name in ("down_bps", "up_bps") if int(controls.get(name) or 0) <= 0]
+    missing_rate = [name for name in ("down_bps", "up_bps") if not rate_configured(controls.get(name))]
     if missing_rate:
         found.append({
             "code": "rate",
             "fields": missing_rate,
-            "detail": "下载和上传字节速率必须是正整数；0 不会关闭限速",
+            "detail": "下载和上传字节速率必须是正整数或明确的 unlimited；0 不会关闭限速",
         })
     record = attestation(db)
     if record is None or float(record["period_end"]) <= now:
@@ -364,8 +389,8 @@ def rejection(db, job_id: int, manifest_hash: str, *, now: float, directories: d
         return "尚未确认网关延迟出站流量也计入本地额度"
     if int(controls.get("daily_bytes") or 0) <= 0 or int(controls.get("monthly_bytes") or 0) <= 0:
         return "必须填写每日和每月字节上限，程序不会假定供应商额度"
-    if int(controls.get("down_bps") or 0) <= 0 or int(controls.get("up_bps") or 0) <= 0:
-        return "必须填写下载和上传字节速率上限"
+    if not rate_configured(controls.get("down_bps")) or not rate_configured(controls.get("up_bps")):
+        return "必须填写下载和上传字节速率上限，或明确写成 unlimited"
     record = attestation(db)
     if record is None or float(record["period_end"]) <= now:
         return "没有未过期的实际剩余额度确认"
@@ -413,8 +438,8 @@ def prepare_resume(
                 raise Refusal("egress", "尚未确认网关延迟出站流量也计入本地额度")
             if int(controls.get("daily_bytes") or 0) <= 0 or int(controls.get("monthly_bytes") or 0) <= 0:
                 raise Refusal("budget", "必须填写每日和每月字节上限，程序不会假定供应商额度")
-            if int(controls.get("down_bps") or 0) <= 0 or int(controls.get("up_bps") or 0) <= 0:
-                raise Refusal("rate", "必须填写下载和上传字节速率上限")
+            if not rate_configured(controls.get("down_bps")) or not rate_configured(controls.get("up_bps")):
+                raise Refusal("rate", "必须填写下载和上传字节速率上限，或明确写成 unlimited")
             record = db._conn.execute(
                 "SELECT * FROM channel_quota_attestation WHERE id=1"
             ).fetchone()

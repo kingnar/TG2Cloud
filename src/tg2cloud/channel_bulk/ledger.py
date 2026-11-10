@@ -22,23 +22,42 @@ class Refusal(Exception):
 
 
 class ByteRate:
-    """Async byte cap. The clock and sleep are injected so tests do not wait."""
+    """Async byte cap. The clock and sleep are injected so tests do not wait.
 
-    def __init__(self, bytes_per_second: int, *, monotonic, sleep):
-        if not isinstance(bytes_per_second, int) or bytes_per_second <= 0:
-            raise Refusal("rate", "下载和上传速率必须是已配置的正数")
-        self.bps = bytes_per_second
+    ``bytes_per_second`` may be a positive int, the exact string ``unlimited``,
+    or a zero-argument callable returning one of those. ``0`` is never unlimited.
+    A callable is read on each chunk so a running job can pick up a new limit.
+    """
+
+    def __init__(self, bytes_per_second, *, monotonic, sleep):
+        self._limit = bytes_per_second if callable(bytes_per_second) else (lambda: bytes_per_second)
         self._monotonic = monotonic
         self._sleep = sleep
         self._next = None
+        self._bps = None
+        self._read_limit()
+
+    def _read_limit(self):
+        limit = self._limit()
+        if limit == "unlimited":
+            return None
+        if type(limit) is not int or isinstance(limit, bool) or limit <= 0:
+            raise Refusal("rate", "下载和上传速率必须是已配置的正数或明确的 unlimited")
+        return limit
 
     async def consume(self, nbytes: int) -> None:
         if nbytes <= 0:
             return
+        limit = self._read_limit()
+        if limit is None:
+            return
+        if self._bps != limit:
+            self._bps = limit
+            self._next = None
         now = float(self._monotonic())
         if self._next is None or self._next < now:
             self._next = now
-        self._next += nbytes / self.bps
+        self._next += nbytes / limit
         delay = self._next - now
         if delay > 0:
             await self._sleep(delay)

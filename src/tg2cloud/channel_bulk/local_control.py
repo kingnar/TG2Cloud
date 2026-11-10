@@ -142,6 +142,7 @@ def _audit(directory: Path, record: dict) -> None:
         "request_id": str(record.get("request_id") or "")[:64],
         "ok": bool(record.get("ok")),
         "error": redact(str(record.get("error") or ""))[:80],
+        "detail": redact(str(record.get("detail") or ""))[:300],
         "inventory_id": record.get("inventory_id"),
         "job_id": record.get("job_id"),
     }
@@ -254,6 +255,7 @@ class LocalControl:
                 "request_id": request_id,
                 "ok": bool(result.get("ok")),
                 "error": result.get("error") or "",
+                "detail": result.get("limits_audit") or "",
                 "inventory_id": result.get("inventory_id"),
                 "job_id": result.get("job_id"),
             })
@@ -465,6 +467,10 @@ class LocalControl:
             "job_id": job["id"],
             "status": job["state"],
             "has_manifest": bool(job["manifest_hash"]),
+            "daily_bytes": job["controls"].get("daily_bytes"),
+            "monthly_bytes": job["controls"].get("monthly_bytes"),
+            "down_bps": job["controls"].get("down_bps"),
+            "up_bps": job["controls"].get("up_bps"),
             "blockers": blocked,
         }
 
@@ -472,17 +478,32 @@ class LocalControl:
         job_id = _number(request.get("job_id"), "job")
         now = time.time()
         if command == "bulk.limits":
+            before = jobs.get_job(self.owner.db, job_id)
             daily = _positive(request.get("daily_bytes"), "daily_bytes")
             monthly = _positive(request.get("monthly_bytes"), "monthly_bytes")
-            down = _positive(request.get("down_bps"), "down_bps")
-            up = _positive(request.get("up_bps"), "up_bps")
+            down = _rate_value(request.get("down_bps"), "down_bps")
+            up = _rate_value(request.get("up_bps"), "up_bps")
             if daily > monthly:
                 raise Refusal("budget", "每日额度不能大于每月额度")
             job = jobs.update_controls(
                 self.owner.db, job_id, now=now,
                 daily_bytes=daily, monthly_bytes=monthly, down_bps=down, up_bps=up,
             )
-            return {"ok": True, "job_id": job["id"], "status": job["state"]}
+            old = before["controls"]
+            audit = (
+                f"daily {old.get('daily_bytes')}->{daily} "
+                f"monthly {old.get('monthly_bytes')}->{monthly} "
+                f"down {old.get('down_bps')}->{down} up {old.get('up_bps')}->{up}"
+            )
+            return {
+                "ok": True,
+                "job_id": job["id"],
+                "status": job["state"],
+                "manifest_hash": job["manifest_hash"],
+                "down_bps": job["controls"]["down_bps"],
+                "up_bps": job["controls"]["up_bps"],
+                "limits_audit": audit,
+            }
         if command == "bulk.whitelist":
             aliases = request.get("aliases")
             if not isinstance(aliases, list) or not all(isinstance(item, str) for item in aliases):
@@ -602,6 +623,12 @@ def _directories(owner) -> dict[str, str]:
     if not isinstance(found, dict):
         return {}
     return {str(key): str(value) for key, value in found.items()}
+
+
+def _rate_value(value, name: str):
+    if value == "unlimited":
+        return "unlimited"
+    return _positive(value, name)
 
 
 def _positive(value, name: str) -> int:

@@ -201,6 +201,25 @@ class ResumeGateTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()[0]
         self.assertEqual(state, "running")
 
+    async def test_limits_audit_records_old_and_new_rates(self):
+        preview = await ask(self.sock, {
+            "command": "bulk.preview", "request_id": "previewlim",
+            "inventory_id": self.inventory["id"], "alias": "media",
+        })
+        changed = await ask(self.sock, {
+            "command": "bulk.limits", "request_id": "limitsunl",
+            "job_id": preview["job_id"],
+            "daily_bytes": 480 * 1024**3, "monthly_bytes": 3400 * 1024**3,
+            "down_bps": "unlimited", "up_bps": "unlimited",
+        })
+        self.assertTrue(changed["ok"])
+        self.assertEqual(changed["down_bps"], "unlimited")
+        self.assertEqual(changed["up_bps"], "unlimited")
+        text = (self.root / "channel-bulk" / "audit.log").read_text(encoding="utf-8")
+        self.assertIn("down 0->unlimited", text)
+        self.assertIn("up 0->unlimited", text)
+        self.assertIn(f"daily 0->{480 * 1024**3}", text)
+
     async def test_other_uid_cannot_resume(self):
         with patch("tg2cloud.channel_bulk.local_control.peer_cred", return_value=(1, os.geteuid() + 1, 0)):
             denied = await ask(self.sock, {
