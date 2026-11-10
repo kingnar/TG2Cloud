@@ -37,6 +37,10 @@ class TransferService(TaskService, TelegramHandlers, CommandHandlers, TaskViews)
     async def start(self) -> None:
         recovered = self.db.recover(self.settings.download_dir)
         self.log.info("重启恢复结果：%s", recovered)
+        from tg2cloud.channel_bulk.jobs import hold_on_startup
+
+        held = hold_on_startup(self.db)
+        self.log.info("频道批量保持暂停：%s", held)
         await self.client.start(bot_token=self.settings.bot_token)
         me = await self.client.get_me()
         self.log.info("Telegram Bot 已登录：@%s", me.username)

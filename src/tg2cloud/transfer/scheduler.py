@@ -181,6 +181,8 @@ async def _start_downloads(self) -> None:
             task_id = int(task["id"])
             if task_id in self.download_tasks:
                 continue
+            if task.get("bulk_job_id"):
+                continue
             if task.get("read_identity", "bot") != "bot":
                 from tg2cloud.listening.account import state as listener_state
                 listener = getattr(self, "listener", None)
@@ -243,6 +245,8 @@ async def _start_uploads(self) -> None:
             if available_slots <= 0:
                 return
             task_id = int(task["id"])
+            if task.get("bulk_job_id"):
+                continue
             current = self.db.get(task_id)
             if not current or current.get("cancel_requested") or current["state"] not in states:
                 continue

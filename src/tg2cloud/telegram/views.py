@@ -131,6 +131,12 @@ class TaskViews:
         if not admin:
             text = "\n".join(line for line in text.splitlines() if not line.startswith(("调度控制", "运行诊断", "临时巡检")))
             text += "\n家庭成员：仅管理自己的任务，文件保存到共同目录。"
+        else:
+            text += (
+                "\n频道盘点：/inventory start <聊天ID>（只读元数据，不下载、不自动转存）\n"
+                "批量转存：/bulk（默认预览；显式 resume 前不会开始）\n"
+                "本地控制：数据目录套接字，不自动盘点、不发消息\n"
+            )
         return text
 
     @staticmethod

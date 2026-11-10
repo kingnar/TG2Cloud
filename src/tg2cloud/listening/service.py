@@ -305,6 +305,7 @@ class Listener:
         )
         self.plans = Plans(self.db, self.admin)
         self.client = None
+        self._rpc_lock = asyncio.Lock()
         self._session = None
         self._last_notice = None
         self._verified_until = {}
@@ -359,6 +360,20 @@ class Listener:
             actor
         ):
             raise PermissionError("管理员授权已失效")
+
+    async def with_client(self, operation):
+        """Run operation(client) on the listener's current client.
+
+        Does not construct a client or copy the session. The same lock covers
+        inventory pages and this listener's history poll.
+        """
+        if (self.client is None or not self.client.is_connected()) and not await self.connect():
+            raise ListenerReadError("个人监听账号未连接")
+        client = self.client
+        async with self._rpc_lock:
+            if self.client is not client or client is None:
+                raise ListenerReadError("监听连接已变化")
+            return await operation(client)
 
     async def close(self):
         client, session = self.client, self._session
@@ -645,16 +660,20 @@ class Listener:
                 (source["id"],),
             )
         # Ascending pages, never a live-event maximum watermark. A batch is bounded.
-        messages = [
-            m
-            async for m in client.iter_messages(
-                source["chat"],
-                min_id=source["cursor"],
-                offset_date=datetime.now(timezone.utc) - timedelta(seconds=LOOKBACK),
-                reverse=True,
-                limit=BATCH + 10,
-            )
-        ]
+        # Share the listener RPC lock with inventory so both use this client.
+        async with self._rpc_lock:
+            if self.client is not client:
+                return
+            messages = [
+                m
+                async for m in client.iter_messages(
+                    source["chat"],
+                    min_id=source["cursor"],
+                    offset_date=datetime.now(timezone.utc) - timedelta(seconds=LOOKBACK),
+                    reverse=True,
+                    limit=BATCH + 10,
+                )
+            ]
         if len(messages) > BATCH:
             tail = getattr(messages[BATCH - 1], "grouped_id", None)
             messages = messages[:BATCH] + (
@@ -800,6 +819,19 @@ class Listener:
 
     async def run(self):
         try:
+            from tg2cloud.channel_bulk.jobs import hold_on_startup
+
+            hold_on_startup(self.db)
+        except Exception:  # noqa: BLE001 - a bookkeeping failure must not disable listening
+            self.owner.log.warning("频道批量作业未自动挂起；批量任务仍不会被调度器领取")
+        control = None
+        try:
+            from tg2cloud.channel_bulk.local_control import start_local_control
+
+            control = await start_local_control(self.owner)
+        except Exception:  # noqa: BLE001 - local control must not stop listening or start a scan
+            self.owner.log.warning("本地控制套接字未开启；不会自动盘点")
+        try:
             while not self.owner._stop.is_set():
                 self._last_loop_at = time.monotonic()
                 self._maintain_if_due()
@@ -845,4 +877,6 @@ class Listener:
                             )
                 await asyncio.sleep(5)
         finally:
+            if control is not None:
+                await control.close()
             await self.close()
