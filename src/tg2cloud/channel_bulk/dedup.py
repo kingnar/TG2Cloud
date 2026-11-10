@@ -26,6 +26,16 @@ def _has_column(db, name: str) -> bool:
     return name in columns
 
 
+def effective_dedup(stored: str | None, live: str) -> str:
+    """Keep a reviewed non-new label when the task table still says new."""
+    if live != "new":
+        return live
+    label = stored or "new"
+    if label != "new":
+        return label
+    return "new"
+
+
 def classify(
     db,
     *,

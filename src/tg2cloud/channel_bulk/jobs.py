@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from tg2cloud.channel_bulk.dedup import classify
+from tg2cloud.channel_bulk.dedup import classify, effective_dedup
 from tg2cloud.channel_bulk.inventory import exclusions, items
 from tg2cloud.channel_bulk.ledger import Refusal, attestation, attested_remaining
 from tg2cloud.channel_bulk.policy import canonical_manifest, selected
@@ -168,6 +168,8 @@ def manifest(db, job_id: int, *, now: float, through: int | None = None, expand:
         raise Refusal("state", "运行中的作业不能改清单")
     if through is not None and (type(through) is not int or isinstance(through, bool) or through <= 0):
         raise Refusal("manifest", "审核上界必须是正整数消息编号")
+    if _transfer_started(db, job_id):
+        raise Refusal("manifest", "已有传输记录，不能重建清单")
     rows = items(db, job["inventory_id"])
     excluded = exclusions(db, job["chat_id"])
     with db._lock:
@@ -191,6 +193,7 @@ def manifest(db, job_id: int, *, now: float, through: int | None = None, expand:
             held_back += 1
             continue
         chosen.append(message_id)
+    previous_hash = str(job["manifest_hash"] or "")
     digest = canonical_manifest(
         job_id, job["chat_id"], job["directory_alias"], job["whitelist"], job["controls"], chosen,
         through=through,
@@ -215,7 +218,14 @@ def manifest(db, job_id: int, *, now: float, through: int | None = None, expand:
         except BaseException:
             db._conn.execute("ROLLBACK")
             raise
-    return {"hash": digest, "count": len(chosen), "ids": chosen, "through": through, "held_back": held_back}
+    return {
+        "hash": digest,
+        "count": len(chosen),
+        "ids": chosen,
+        "through": through,
+        "held_back": held_back,
+        "superseded_hash": previous_hash if previous_hash and previous_hash != digest else "",
+    }
 
 
 def blockers(db, job_id: int, manifest_hash: str, *, now: float, directories: dict[str, str]) -> list[dict]:
@@ -437,6 +447,19 @@ def hold_on_startup(db, now: float | None = None) -> dict[str, int]:
     return {"inventories": inventories, "jobs": jobs}
 
 
+def _transfer_started(db, job_id: int) -> bool:
+    with db._lock:
+        row = db._conn.execute(
+            """SELECT COUNT(*) FROM channel_bulk_items
+               WHERE job_id=? AND (
+                   status!='pending' OR attempts!=0 OR IFNULL(bytes_charged,0)!=0
+                   OR task_id IS NOT NULL
+               )""",
+            (int(job_id),),
+        ).fetchone()
+    return int(row[0]) > 0
+
+
 def candidate_rows(db, job: dict) -> list[dict]:
     excluded = exclusions(db, job["chat_id"])
     rows = []
@@ -448,10 +471,11 @@ def candidate_rows(db, job: dict) -> list[dict]:
             media_key=row.get("media_key"),
             file_unique_id=row.get("file_unique_id"),
         )
+        merged = effective_dedup(row.get("review_dedup"), kind)
         row = dict(row)
-        row["dedup"] = kind
+        row["dedup"] = merged
         row["blocked_task"] = None if task is None else int(task["id"])
-        row["chosen"] = selected(row, excluded=excluded, dedup=kind, controls=job["controls"])
+        row["chosen"] = selected(row, excluded=excluded, dedup=merged, controls=job["controls"])
         rows.append(row)
     return rows
 

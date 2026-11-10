@@ -10,7 +10,7 @@ import io
 import json
 from typing import Any
 
-from tg2cloud.channel_bulk.dedup import classify
+from tg2cloud.channel_bulk.dedup import classify, effective_dedup
 from tg2cloud.channel_bulk.ledger import cooldown_seconds
 from tg2cloud.channel_bulk.policy import message_link, summarize
 from tg2cloud.channel_bulk.schema import ensure_db
@@ -308,6 +308,7 @@ def items(db, inventory_id: int) -> list[dict]:
             )
         ]
     for row in rows:
+        stored = str(row.get("dedup") or "new")
         kind, _task = classify(
             db,
             chat_id=int(inventory["chat_id"]),
@@ -315,7 +316,8 @@ def items(db, inventory_id: int) -> list[dict]:
             media_key=row.get("media_key"),
             file_unique_id=row.get("file_unique_id"),
         )
-        row["dedup"] = kind
+        row["review_dedup"] = stored
+        row["dedup"] = effective_dedup(stored, kind)
         row["duration"] = None if row["duration"] is None else float(row["duration"])
     return rows
 

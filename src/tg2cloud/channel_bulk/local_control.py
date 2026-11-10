@@ -538,6 +538,7 @@ class LocalControl:
                 "count": built["count"],
                 "through": through,
                 "held_back": built["held_back"],
+                "superseded_hash": built.get("superseded_hash") or "",
             }
         if command == "bulk.resume":
             digest = request.get("manifest_hash")
