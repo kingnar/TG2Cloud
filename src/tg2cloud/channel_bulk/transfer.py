@@ -14,6 +14,7 @@ from tg2cloud.channel_bulk.ledger import (
     cooldown_seconds,
     disk_allows,
 )
+from tg2cloud.channel_bulk.names import SourceMissing, allocate_remote, display_filename
 from tg2cloud.channel_bulk.remote_evidence import assess
 from tg2cloud.domain.errors import RemoteReviewRequired, failure_kind, safe_failure
 from tg2cloud.domain.naming import safe_file_name
@@ -154,6 +155,12 @@ async def _one(ctx, job: dict) -> str:
         return "continue"
     local = _local_path(ctx, task)
     if task["state"] in {"queued", "download_failed", "reserved", "downloading"} or not local.is_file():
+        try:
+            info = await _source_info(ctx, job, media)
+            await _ensure_remote(ctx, job, task, media, info)
+        except SourceMissing as exc:
+            _skip_deleted(ctx, job, item, task, str(exc))
+            return "continue"
         gate = _pre_io(ctx, job, int(media["size"]))
         if gate:
             return gate
@@ -167,6 +174,9 @@ async def _one(ctx, job: dict) -> str:
         _add_bytes(ctx.db, job["id"], item["message_id"], int(media["size"]))
         try:
             await _download(ctx, job, task, media, local)
+        except SourceMissing as exc:
+            _skip_deleted(ctx, job, item, task, str(exc))
+            return "continue"
         except Exception as exc:  # noqa: BLE001 - persist the failure and keep the job paused
             return _io_failure(ctx, job, item, task, exc, stage="download")
     fresh = ctx.db.get(int(task["id"])) or task
@@ -295,7 +305,11 @@ async def _upload(ctx, job, task, media, local: Path, item: dict) -> str:
         pause(ctx.db, job["id"], now=ctx.now(), error="本地文件缺失，批量暂停")
         return "local"
     rate = ByteRate(lambda: get_job(ctx.db, job["id"])["controls"]["up_bps"], monotonic=ctx.monotonic, sleep=ctx.sleep)
-    remote = _remote_name(ctx.directory, task)
+    try:
+        remote = await _ensure_remote(ctx, job, task, media, allow_missing=True)
+    except SourceMissing as exc:
+        _skip_deleted(ctx, job, item, task, str(exc))
+        return "continue"
     if task["state"] == "waiting_upload":
         ctx.db.transition(int(task["id"]), "uploading", remote_temp_path=remote, error=None)
     elif task["state"] == "upload_failed_retained":
@@ -351,11 +365,91 @@ async def _upload(ctx, job, task, media, local: Path, item: dict) -> str:
     return "continue"
 
 
+def _remember_remote(db, task_id: int, remote: str) -> None:
+    with db._lock:
+        db._conn.execute(
+            "UPDATE tasks SET remote_path=?, remote_final_path=?, updated_at=? WHERE id=?",
+            (remote, remote, time.time(), int(task_id)),
+        )
+
+
+def _skip_deleted(ctx, job, item, task, reason: str) -> None:
+    text = str(reason or "消息已不存在")[:200]
+    try:
+        current = ctx.db.get(int(task["id"])) if task else None
+        if current and current["state"] in {"downloading", "reserved"}:
+            ctx.db.transition(int(task["id"]), "download_failed", local_path=None, error=text, downloaded_bytes=0)
+        elif current and current["state"] == "queued":
+            ctx.db.transition(int(task["id"]), "cancelled", error=text, local_path=None)
+        elif current is not None:
+            with ctx.db._lock:
+                ctx.db._conn.execute(
+                    "UPDATE tasks SET error=?, updated_at=? WHERE id=?",
+                    (text, time.time(), int(current["id"])),
+                )
+    except Exception:  # noqa: BLE001 - the item must still leave the pending queue
+        __import__("logging").getLogger("tg2cloud.channel_bulk").warning(
+            "跳过已删除来源时未能更新任务状态",
+        )
+    _update_item(
+        ctx.db, job["id"], item["message_id"], status="skipped_source_deleted", last_error=text,
+    )
+
+
+async def _name_taken(ctx, path: str, task_id: int) -> bool:
+    if ctx.db.remote_claimed(path, task_id):
+        return True
+    with ctx.db._lock:
+        row = ctx.db._conn.execute(
+            """SELECT 1 FROM tasks WHERE id!=? AND state!='cancelled'
+               AND (remote_path=? OR remote_final_path=? OR remote_temp_path=?) LIMIT 1""",
+            (int(task_id), path, path, path),
+        ).fetchone()
+    if row is not None:
+        return True
+    exists = getattr(ctx.transport, "exists", None)
+    if exists is None:
+        return False
+    return bool(await exists(path))
+
+
+async def _source_info(ctx, job, media) -> dict:
+    inspect = getattr(ctx.transport, "inspect_source", None)
+    if inspect is None:
+        return {"caption": "", "file_name": media.get("file_name"), "mime": media.get("mime")}
+    payload = dict(media)
+    payload["chat_id"] = int(job["chat_id"])
+    return await inspect(item=payload)
+
+
+async def _ensure_remote(ctx, job, task, media, info=None, *, allow_missing: bool = False) -> str:
+    current = ctx.db.get(int(task["id"])) or task
+    saved = str(current.get("remote_final_path") or current.get("remote_path") or "")
+    if saved:
+        return saved
+    if info is None:
+        try:
+            info = await _source_info(ctx, job, media)
+        except SourceMissing:
+            if not allow_missing:
+                raise
+            info = {"caption": "", "file_name": media.get("file_name"), "mime": media.get("mime")}
+    filename = display_filename(
+        info.get("caption"), info.get("file_name") or media.get("file_name"),
+        int(media["message_id"]), info.get("mime") or media.get("mime"),
+    )
+    remote = await allocate_remote(
+        ctx.directory, filename, int(media["message_id"]),
+        lambda path: _name_taken(ctx, path, int(task["id"])),
+    )
+    _remember_remote(ctx.db, int(task["id"]), remote)
+    return remote
+
+
 def _remote_name(directory: str, task: dict) -> str:
-    name = safe_file_name(str(task["file_name"]), f"task-{task['id']}.bin")
-    path = Path(name)
-    stamped = f"{path.stem} (task-{int(task['id'])}){path.suffix}"
-    return f"{directory}/{stamped}" if directory else stamped
+    """Legacy helper kept for callers that only have a task row."""
+    name = safe_file_name(str(task["file_name"]), f"video-{task.get('message_id', task['id'])}.mp4")
+    return f"{directory}/{name}" if directory else name
 
 
 def _attempts(db, job_id: int, message_id: int) -> int:

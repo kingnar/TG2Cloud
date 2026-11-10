@@ -11,8 +11,12 @@ CHUNK = 512 * 1024
 
 
 async def download_bounded(client, message, path: Path, rate, size: int) -> None:
+    from tg2cloud.channel_bulk.names import SourceMissing
+
     document = getattr(message, "document", None)
-    if document is None or int(getattr(document, "size", 0) or 0) != int(size):
+    if document is None:
+        raise SourceMissing("消息没有可下载的媒体")
+    if int(getattr(document, "size", 0) or 0) != int(size):
         raise RuntimeError("消息没有与清单一致的文档，已停止该条")
     path.parent.mkdir(parents=True, exist_ok=True)
     offset = 0
@@ -74,8 +78,30 @@ class ListenerTransport:
         entity = await verified_chat(client, int(item["chat_id"]))
         message = await client.get_messages(entity, ids=int(item["message_id"]))
         if not message:
-            raise RuntimeError("消息已不存在")
+            from tg2cloud.channel_bulk.names import SourceMissing
+
+            raise SourceMissing("消息已不存在")
+        document = getattr(message, "document", None)
+        video = getattr(message, "video", None)
+        if document is None and video is None:
+            from tg2cloud.channel_bulk.names import SourceMissing
+
+            raise SourceMissing("消息没有可下载的媒体")
         return message
+
+    async def inspect_source(self, *, item):
+        listener = self.owner.listener
+
+        async def operation(client):
+            message = await self._message(client, item)
+            file = getattr(message, "file", None)
+            return {
+                "caption": getattr(message, "raw_text", None) or getattr(message, "message", None) or "",
+                "file_name": getattr(file, "name", None) or item.get("file_name"),
+                "mime": getattr(file, "mime_type", None) or item.get("mime"),
+            }
+
+        return await listener.with_client(operation)
 
     async def download(self, *, item, path, rate, size):
         listener = self.owner.listener
@@ -85,6 +111,9 @@ class ListenerTransport:
             await download_bounded(client, message, path, rate, size)
 
         await listener.with_client(operation)
+
+    async def exists(self, path: str) -> bool:
+        return bool(await self.owner.rclone.exists(path))
 
     async def upload(self, *, item, path, remote, rate, size):
         del item, size

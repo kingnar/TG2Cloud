@@ -2,7 +2,7 @@
 
 The socket is mode 0600 and accepts only the process uid, plus uids listed in
 an optional mode-0600 allow file. Requests are a fixed JSON command set.
-They are not executed as code and they do not open a Telegram client.
+They are not executed as code and they do not open a second Telegram client.
 """
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ _COMMANDS = {
     "bulk.resume",
     "bulk.pause",
     "bulk.cancel",
+    "bulk.rename-completed",
     "remote.verify",
     "ping",
 }
@@ -581,7 +582,37 @@ class LocalControl:
         if command == "bulk.cancel":
             job = jobs.cancel(self.owner.db, job_id, now=now)
             return {"ok": True, "job_id": job["id"], "status": job["state"]}
+        if command == "bulk.rename-completed":
+            return await self._rename_completed(request, job_id)
         return {"ok": False, "error": "bad-request"}
+
+    async def _rename_completed(self, request: dict, job_id: int) -> dict:
+        from tg2cloud.channel_bulk.rename_remote import WebDavFiles, rename_completed
+        from tg2cloud.channel_bulk.runtime import ListenerTransport
+
+        dry_run = _dry_run(request)
+        job = jobs.get_job(self.owner.db, job_id)
+        transport = ListenerTransport(self.owner)
+
+        async def fetch_caption(message_id: int) -> str:
+            info = await transport.inspect_source(item={
+                "chat_id": int(job["chat_id"]),
+                "message_id": int(message_id),
+            })
+            return str(info.get("caption") or "")
+
+        dav = None
+        if not dry_run:
+            settings = self.owner.settings
+            url = str(getattr(settings, "cd2_url", "") or "")
+            user = str(getattr(settings, "cd2_user", "") or "")
+            password = str(getattr(settings, "cd2_password", "") or "")
+            if not url or not user or not password:
+                return {"ok": False, "error": "blocked", "code": "webdav", "detail": "WebDAV 未配置"}
+            dav = WebDavFiles(url, user, password)
+        return await rename_completed(
+            self.owner.db, job_id, fetch_caption=fetch_caption, dav=dav, dry_run=dry_run,
+        )
 
     async def _verify(self, request: dict) -> dict:
         from tg2cloud.channel_bulk.cd2api import read_back, safe_relative
@@ -623,6 +654,16 @@ def _directories(owner) -> dict[str, str]:
     if not isinstance(found, dict):
         return {}
     return {str(key): str(value) for key, value in found.items()}
+
+
+def _dry_run(request: dict) -> bool:
+    """Rename and other admin previews stay read-only unless dry_run is false."""
+    if "dry_run" not in request:
+        return True
+    value = request["dry_run"]
+    if type(value) is not bool:
+        raise ValueError("bad-request")
+    return value
 
 
 def _rate_value(value, name: str):

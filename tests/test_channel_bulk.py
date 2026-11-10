@@ -13,6 +13,7 @@ from tg2cloud.channel_bulk.control import handle
 from tg2cloud.channel_bulk.dedup import classify
 from tg2cloud.channel_bulk.fingerprint import sample_sha256
 from tg2cloud.channel_bulk.ledger import ByteRate, attest, charge, totals
+from tg2cloud.channel_bulk.names import SourceMissing
 from tg2cloud.channel_bulk.runtime import download_bounded
 from tg2cloud.channel_bulk.transfer import run_job
 from tg2cloud.domain.actors import user_scope
@@ -752,6 +753,139 @@ class ChannelBulkTests(unittest.TestCase):
         jobs.pause(self.db, job["id"], now=self.clock.now(), error=None)
         cleared = jobs.update_controls(self.db, job["id"], now=self.clock.now(), min_duration=31)
         self.assertEqual(cleared["manifest_hash"], "")
+
+    def test_deleted_source_is_skipped_and_caption_name_is_kept(self):
+        job = self._job_with([
+            video(86, duration=90, size=500),
+            video(88, duration=90, size=20),
+            video(87, duration=90, size=40),
+        ])
+        self._arm(job["id"])
+        digest = jobs.get_job(self.db, job["id"])["manifest_hash"]
+        self.assertTrue(charge(self.db, 500, now=self.clock.now(), daily_cap=10**9, monthly_cap=10**9))
+        self.db._conn.execute(
+            "UPDATE channel_bulk_items SET bytes_charged=500, attempts=1 WHERE job_id=? AND message_id=86",
+            (job["id"],),
+        )
+        before = totals(self.db, self.clock.now())["daily"]
+
+        class Sources(Transport):
+            def __init__(self):
+                super().__init__(evidence=True)
+                self.seen = []
+
+            async def inspect_source(self, *, item):
+                message_id = int(item["message_id"])
+                if message_id == 86:
+                    raise SourceMissing("消息已不存在")
+                if message_id == 88:
+                    raise SourceMissing("消息没有可下载的媒体")
+                return {"caption": "城市夜景，第一集", "file_name": "1.mp4", "mime": "video/mp4"}
+
+            async def upload(self, *, item, path, remote, rate, size):
+                saved = self_db.get(int(path.name.split("-", 1)[0]))
+                self.seen.append((remote, saved["remote_final_path"] if saved else None))
+                await super().upload(item=item, path=path, remote=remote, rate=rate, size=size)
+
+        self_db = self.db
+        transport = Sources()
+        ctx = Ctx(self.db, job["id"], "library/videos", self.clock, transport, self.root, 42)
+        self.assertEqual(asyncio.run(run_job(ctx)), "idle")
+        finished = jobs.get_job(self.db, job["id"])
+        self.assertEqual(finished["state"], "done")
+        self.assertEqual(finished["manifest_hash"], digest)
+        self.assertIsNone(finished["error"])
+        self.assertEqual(totals(self.db, self.clock.now())["daily"], before + 80)
+        missing = self.db._conn.execute(
+            "SELECT status, last_error, bytes_charged FROM channel_bulk_items WHERE message_id=86"
+        ).fetchone()
+        self.assertEqual(missing["status"], "skipped_source_deleted")
+        self.assertEqual(missing["last_error"], "消息已不存在")
+        self.assertEqual(missing["bytes_charged"], 500)
+        absent = self.db._conn.execute(
+            "SELECT status, last_error, bytes_charged FROM channel_bulk_items WHERE message_id=88"
+        ).fetchone()
+        self.assertEqual(absent["status"], "skipped_source_deleted")
+        self.assertEqual(absent["last_error"], "消息没有可下载的媒体")
+        self.assertEqual(absent["bytes_charged"], 0)
+        task = self.db._conn.execute(
+            "SELECT error, state FROM tasks WHERE message_id=86"
+        ).fetchone()
+        self.assertEqual(task["error"], "消息已不存在")
+        self.assertNotEqual(task["state"], "completed")
+        done = self.db._conn.execute(
+            "SELECT remote_final_path, remote_path FROM tasks WHERE message_id=87"
+        ).fetchone()
+        self.assertEqual(done["remote_final_path"], "library/videos/城市夜景，第一集.mp4")
+        self.assertEqual(done["remote_path"], done["remote_final_path"])
+        self.assertNotIn("(task-", done["remote_final_path"])
+        self.assertEqual(transport.seen, [(done["remote_final_path"], done["remote_final_path"])])
+        self.assertEqual(transport.downloads, 1)
+
+    def test_saved_remote_name_is_reused_when_caption_changes(self):
+        job = self._job_with([video(90, duration=90, size=32)])
+        self._arm(job["id"])
+        jobs.update_controls(self.db, job["id"], now=self.clock.now(), max_attempts=4)
+
+        class Named(Transport):
+            def __init__(self):
+                super().__init__(evidence=True)
+                self.caption = "城市夜景"
+                self.uploads = 0
+
+            async def inspect_source(self, *, item):
+                return {"caption": self.caption, "file_name": "1.mp4", "mime": "video/mp4"}
+
+            async def upload(self, *, item, path, remote, rate, size):
+                self.uploads += 1
+                if self.uploads == 1:
+                    raise RuntimeError("upload broke")
+                await Transport.upload(self, item=item, path=path, remote=remote, rate=rate, size=size)
+
+        transport = Named()
+        ctx = Ctx(self.db, job["id"], "library/videos", self.clock, transport, self.root, 42)
+        self.assertEqual(asyncio.run(run_job(ctx)), "failed")
+        saved = self.db._conn.execute(
+            "SELECT remote_final_path FROM tasks WHERE message_id=90"
+        ).fetchone()["remote_final_path"]
+        self.assertEqual(saved, "library/videos/城市夜景.mp4")
+        transport.caption = "另一条标题"
+        jobs.prepare_resume(
+            self.db, job["id"], jobs.get_job(self.db, job["id"])["manifest_hash"],
+            now=self.clock.now(), disk_free=10**12, min_free=0,
+            directories={"media": "library/videos"},
+        )
+        self.assertEqual(asyncio.run(run_job(ctx)), "idle")
+        again = self.db._conn.execute(
+            "SELECT remote_final_path, state FROM tasks WHERE message_id=90"
+        ).fetchone()
+        self.assertEqual(again["state"], "completed")
+        self.assertEqual(again["remote_final_path"], saved)
+
+    def test_caption_collision_adds_message_suffix_only(self):
+        job = self._job_with([
+            video(10, duration=90, size=16),
+            video(11, duration=90, size=16),
+        ])
+        self._arm(job["id"])
+
+        class Same(Transport):
+            async def inspect_source(self, *, item):
+                return {"caption": "同一标题", "file_name": "1.mp4", "mime": "video/mp4"}
+
+        ctx = Ctx(
+            self.db, job["id"], "library/videos", self.clock,
+            Same(evidence=True), self.root, 42,
+        )
+        self.assertEqual(asyncio.run(run_job(ctx)), "idle")
+        rows = {
+            int(row["message_id"]): row["remote_final_path"]
+            for row in self.db._conn.execute(
+                "SELECT message_id, remote_final_path FROM tasks ORDER BY message_id"
+            )
+        }
+        self.assertEqual(rows[10], "library/videos/同一标题.mp4")
+        self.assertEqual(rows[11], "library/videos/同一标题 (message-11).mp4")
 
 
 if __name__ == "__main__":
